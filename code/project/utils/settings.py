@@ -91,14 +91,16 @@ def init_params(model, scip_limits, scip_params):
 
 
 settings = {
+    #沙盒模式,于强化学习训练,目的：减少随机因素，让智能体的决策更明显
     'sandbox': {
         'heuristics': False,  # enable primal heuristics
         'cutoff': True,  # provide cutoff (value needs to be passed to the environment)
         'conflict_usesb': False,  # use SB conflict analysis
         'probing_bounds': False,  # use probing bounds identified during SB
         'checksol': False,
-        'reevalage': 0,
+        'reevalage': 0, #强分支中变量分数的重新评估频率,0确保每次分支都使用最新信息
     },
+    #用于基准测试和传统求解,启用所有高级功能，作为性能基准
     'default': {
         'heuristics': True,
         'cutoff': False,
@@ -112,7 +114,7 @@ settings = {
 # limits in solvers
 scip_limits = {
     'node_limit': -1,
-    'time_limit': 600.,
+    'time_limit': 900.,
 }
 
 state_dims = {

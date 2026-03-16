@@ -3,9 +3,12 @@ import torch as T
 import numpy as np
 import traceback
 
+from BiGragh.recorders import LPFeatureRecorder
+from BiGragh.utils import normalize_graph
+
 
 class Brancher(scip.Branchrule):
-    def __init__(self, model, state_dims, device, agent, reward_func, cutoff, logger):
+    def __init__(self, model, state_dims, device, agent, reward_func, cutoff, logger,recorder):
         super().__init__()
         self.model = model
         self.var_dim = state_dims["var_dim"]
@@ -26,6 +29,8 @@ class Brancher(scip.Branchrule):
         self.prev_value = None
         self.prev_log_prob = None
 
+        self.recorder = recorder
+
     def _is_solved(self):
         status = self.model.getStatus()
         return status in ("optimal", "infeasible", "unbounded", "timelimit")
@@ -40,10 +45,91 @@ class Brancher(scip.Branchrule):
                 self.logger.error("No candidates available for branching.")
                 return {"result": scip.SCIP_RESULT.DIDNOTRUN}
 
+            
+            # ----------------【种子截断】--------------------------
+            MAX_SEEDS = 400
+            if len(cands) > MAX_SEEDS:
+                # 使用第 0 列 (lpcandsfrac) 排序，选出分数最大的前 400 个
+                scores = cands_state_mat[:, 0]
+                # 选取前 400 个索引 (这里用 np.argsort 因为 cands_state_mat 是 numpy 数组)
+                top_k_indices = np.argsort(scores)[-MAX_SEEDS:]
+                
+                # 同步截断所有相关列表
+                cands = [cands[i] for i in top_k_indices]
+                cands_state_mat = cands_state_mat[top_k_indices, :]
+                cands_pos = [cands_pos[i] for i in top_k_indices]
+            #--------------------------------------------------------------------
+
             # 节点特征（node_dim=8维）
             node_state = self.model.getNodeState(self.node_dim).astype('float32')
             # MIP特征（mip_dim=53维）
             mip_state = self.model.getMIPState(self.mip_dim).astype('float32')
+
+            ############################### 新加入 #################################
+            # 1. 获取当前正在处理的节点
+            curr_node = self.model.getCurrentNode()
+
+            # 手动设置你需要的 K 值，例如 2
+            K_HOPS = 2
+            # 2. 更新并记录当前节点的二分图状态 触发局部图提取
+            self.recorder.record_sub_milp_graph(self.model, curr_node, cands=cands,k_hops=K_HOPS)
+            
+            # 3. 提取图数据 根据当前节点的唯一编号，从 Recorder 的字典里把刚才提取好的“局部图对象”拿出来。
+            graph_data = self.recorder.recorded[curr_node.getNumber()]
+            
+            var_feats = graph_data.var_attributes # 变量特征 [n_vars, 6]
+            cons_feats = graph_data.cons_attributes   # 这是我们在 Recorder 中新存的
+            edge_index = graph_data.local_edge_index   # 已经是局部映射后的索引 [0, 1000]
+            edge_attr = graph_data.local_edge_attr     # 对应的边系数
+            lb, ub = curr_node.getLowerbound(), curr_node.getEstimate()
+            if self.model.getObjectiveSense() == 'maximize':
+                lb, ub = ub, lb
+                
+            bounds = T.tensor([[lb, -1 * ub]], device=self.device).float()
+            depth = T.tensor([curr_node.getDepth()], device=self.device).float()
+
+            # ================== 变量取值验证审计 ==================
+            # print(f"\n" + "!"*20 + " 数据流验证 " + "!"*20)
+            # data_to_check = {
+            #     "var_feats": var_feats,
+            #     "cons_feats": cons_feats,
+            #     "edge_index": edge_index,
+            #     "edge_attr": edge_attr,
+            #     "bounds": bounds,
+            #     "depth": depth
+            # }
+
+            # for name, tensor in data_to_check.items():
+            #     if tensor is None:
+            #         print(f"CRITICAL: {name} 是 None!")
+            #     elif isinstance(tensor, T.Tensor):
+            #         # 打印形状，重点看第一维是不是 0
+            #         print(f"CHECK: {name:12} | Shape: {list(tensor.shape)} | Device: {tensor.device}")
+            #         if tensor.numel() == 0:
+            #             print(f"   --> WARNING: {name} 元素数量为 0 (空张量)!")
+            #     else:
+            #         print(f"CHECK: {name:12} | Value: {tensor} (非 Tensor 类型)")
+
+            # # 针对你之前的 Size(400) vs Size(0) 报错，做一个强制断言提示
+            # if var_feats.shape[0] > 0 and cons_feats.shape[0] == 0:
+            #     print(f"MATCH FOUND: 发现【有变量但没约束】的情况！这就是导致 GNN 崩溃的原因。")
+            # print("!"*50 + "\n")
+            # ====================================================
+
+
+            # 6. 归一化 (直接传入局部图数据)
+            norm_cons, norm_edge_idx, norm_edge_attr, norm_var, norm_bounds, _ = normalize_graph(
+                cons_feats, edge_index, edge_attr, 
+                var_feats, bounds, depth
+            )
+            #  # 6. 归一化 (调用项目提供的 utils.py)
+            # norm_cons, norm_edge_idx, norm_edge_attr, norm_var, norm_bounds, _ = normalize_graph(
+            #     cons_feats.clone(), edge_index.clone(), edge_attr.clone(), 
+            #     var_feats.clone(), bounds.clone(), depth.clone()
+            # )
+
+            ####################################################################
+
 
             # 转格式
             if isinstance(cands_state_mat, np.ndarray):
@@ -63,6 +149,8 @@ class Brancher(scip.Branchrule):
             node_state_tensor = T.from_numpy(node_state).to(self.device)
             mip_state_tensor = T.from_numpy(mip_state).to(self.device)
 
+            
+
             #存储“上一步”的 transition （s,a,r,s）
             if self.prev_state is not None:
                 done = self._is_solved()
@@ -74,8 +162,15 @@ class Brancher(scip.Branchrule):
                         cands_state=self.prev_state['cands_state'],
                         mip_state=self.prev_state['mip_state'],
                         node_state=self.prev_state['node_state'],
+
+                        norm_cons = self.prev_state['norm_cons'],
+                        norm_edge_idx = self.prev_state['norm_edge_idx'],
+                        norm_edge_attr = self.prev_state['norm_edge_attr'],
+                        norm_var = self.prev_state['norm_var'],
+                        norm_bounds = self.prev_state['norm_bounds'],
+
                         action=self.prev_action,
-                        reward=float(step_reward),
+                        reward=float(step_reward) * 0.01,
                         done=bool(done),
                         value=float(self.prev_value),
                         log_prob=float(self.prev_log_prob),
@@ -106,10 +201,21 @@ class Brancher(scip.Branchrule):
             # )
 
             # 调用 choose_action，接收新增的 truncated_action
+            #final_action:原始候选变量集合 cands 里的索引,只是一个索引
+            #truncated_action:被截断后的候选集合里的索引
+            #truncated_state:截断后的变量列表
+            #truncated_action:选中的动作在truncated_state的下标
             final_action, value, log_prob, truncated_state, truncated_action = self.agent.choose_action(
                 cands_state_tensor.cpu().numpy(),
                 mip_state_tensor.cpu().numpy(),
                 node_state_tensor.cpu().numpy(),
+
+                norm_cons=norm_cons.cpu().numpy(),          # 形状 [n_cons, 4]
+                norm_edge_idx=norm_edge_idx.cpu().numpy(),  # 形状 [2, n_edges]
+                norm_edge_attr=norm_edge_attr.cpu().numpy(),# 形状 [n_edges, 1]
+                norm_var=norm_var.cpu().numpy(),            # 形状 [n_vars, 6]
+                norm_bounds=norm_bounds.cpu().numpy(),      # 形状 [1, 2]
+                
                 padding_mask=padding_mask,
                 deterministic=False,
             )
@@ -133,8 +239,8 @@ class Brancher(scip.Branchrule):
             # self.model.branchVar(selected_var)
 
             # 1. 执行分支使用原始索引 (final_action)
-            selected_var = cands[final_action]
-            self.model.branchVar(selected_var)
+            selected_var = cands[final_action]  #选择的变量
+            self.model.branchVar(selected_var) #强制求解器对指定的变量进行分支（Branching）操作
 
 
             self.branch_count += 1
@@ -150,6 +256,14 @@ class Brancher(scip.Branchrule):
                 'cands_state': truncated_state.clone(), # 存入已经截断后的 500 维特征
                 'mip_state': mip_state_tensor.clone(),
                 'node_state': node_state_tensor.clone(),
+
+                # 存入归一化后的 numpy 或 tensor 格式（建议 numpy 保持与前三个一致）
+                'norm_cons': norm_cons.clone() if T.is_tensor(norm_cons) else norm_cons,
+                'norm_edge_idx': norm_edge_idx.clone() if T.is_tensor(norm_edge_idx) else norm_edge_idx,
+                'norm_edge_attr': norm_edge_attr.clone() if T.is_tensor(norm_edge_attr) else norm_edge_attr,
+                'norm_var': norm_var.clone() if T.is_tensor(norm_var) else norm_var,
+                'norm_bounds': norm_bounds.clone() if T.is_tensor(norm_bounds) else norm_bounds,
+
             }
             self.prev_action = truncated_action # 存入 0-499 之间的相对索引
 
@@ -190,8 +304,15 @@ class Brancher(scip.Branchrule):
                     cands_state=self.prev_state['cands_state'],
                     mip_state=self.prev_state['mip_state'],
                     node_state=self.prev_state['node_state'],
+                    # --- 新增二分图特征 ---
+                    norm_cons=self.prev_state['norm_cons'],
+                    norm_edge_idx=self.prev_state['norm_edge_idx'],
+                    norm_edge_attr=self.prev_state['norm_edge_attr'],
+                    norm_var=self.prev_state['norm_var'],
+                    norm_bounds=self.prev_state['norm_bounds'],
+                    # --------------------
                     action=self.prev_action,
-                    reward=float(terminal_reward),
+                    reward=float(terminal_reward) ,
                     done=True,
                     value=float(self.prev_value),
                     log_prob=float(self.prev_log_prob),

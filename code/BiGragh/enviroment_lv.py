@@ -1,11 +1,11 @@
 import pyscipopt as scip
 from project.utils import init_params
-from project.brancher import Brancher
+from BiGragh.bracher_lv import Brancher
 import numpy as np
 import torch as T
 import traceback
 
-
+from BiGragh.recorders import LPFeatureRecorder
 
 class Environment:
     def __init__(self, device, agent, state_dims, scip_limits, scip_params, scip_seed, reward_func, logger):
@@ -34,7 +34,7 @@ class Environment:
         self.baseline_integral = None
         self.baseline_status = None
 
-       
+        self.recorder = None
 
     #求解完成判断
     def _is_solved(self):
@@ -76,9 +76,17 @@ class Environment:
             bg = float(baseline_gap) if baseline_gap is not None else 0.0
             bp = float(baseline_integral) if baseline_integral is not None else 1.0
             bs = baseline_status if baseline_status is not None else 'timelimit'
-            #奖励函数
+
+            #奖励函数参数设置
+            # H4
+            # self.reward_func.reset(self.model, time_limit=3600)
+           
+
             self.reward_func.reset(baseline_nodes=bn, baseline_gap=bg, baseline_pdi=bp,
-                                   solver_status=bs, time_limit=3600, logger=self.logger)
+                                   solver_status=bs, time_limit=900, logger=self.logger)
+            # self.reward_func.reset(baseline_nodes=bn, baseline_gap=bg, baseline_pdi=bp,
+            # solver_status=bs, time_limit=3600, logger=None)
+                                   
 
             if self.scip_params.get('cutoff', False) and self.cutoff is not None:
                 self.model.setObjlimit(float(self.cutoff))
@@ -94,7 +102,7 @@ class Environment:
         try:
             self.episode_count += 1
 
-            
+            self.recorder = LPFeatureRecorder(self.model, self.device)
             
             # 提取特征
             self.brancher = Brancher(
@@ -105,6 +113,7 @@ class Environment:
                 reward_func=self.reward_func,
                 cutoff=self.cutoff,
                 logger=self.logger,
+                recorder=self.recorder,  # <-- 新增：传递引用
             )
 
             self.model.includeBranchrule(
@@ -132,15 +141,15 @@ class Environment:
 
             gap_val = 0.0 if done else self.model.getGap()
 
-            self.logger.info(
-                f"Episode {self.episode_count} completed - "
-                f"Status: {status}, "
-                f"Branches: {self.brancher.branch_count}, "
-                f"Nodes: {self.model.getNNodes()}, "
-                f"Total Reward: {episode_reward:.4f}, "
-                f"Reward Count: {len(reward_list)}, "
-                f"Gap: {gap_val:.4%}"
-            )
+            # self.logger.info(
+            #     f"Episode {self.episode_count} completed - "
+            #     f"Status: {status}, "
+            #     f"Branches: {self.brancher.branch_count}, "
+            #     f"Nodes: {self.model.getNNodes()}, "
+            #     f"Total Reward: {episode_reward:.4f}, "
+            #     f"Reward Count: {len(reward_list)}, "
+            #     f"Gap: {gap_val:.4%}"
+            # )
 
             self.brancher.episode_rewards = []
 
@@ -163,8 +172,10 @@ class Environment:
             self.total_nodes += info['nnodes']
 
             self.model.freeProb()
+            self.recorder.clear()
             self.model = None
             self.brancher = None
+            self.recorder = None # 彻底断开引用
 
             return done, info, episode_reward
         except Exception as e:

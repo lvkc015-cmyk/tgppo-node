@@ -6,20 +6,56 @@ import uuid
 import pandas as pd
 import logging
 
+# def setup_logging(log_file=None):
+#     if log_file is None:
+#         log_file = f"logs/ppo_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+#     logging.basicConfig(
+#         level=logging.DEBUG,
+#         format='%(asctime)s - %(levelname)s - %(message)s',
+#         handlers=[
+#             logging.FileHandler(log_file),
+#             logging.StreamHandler(sys.stdout)
+#         ]
+#     )
+#     return logging.getLogger(__name__)
+
+import multiprocessing
+import sys
+import logging
+from datetime import datetime
+
 def setup_logging(log_file=None):
     if log_file is None:
         log_file = f"logs/ppo_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    return logging.getLogger(__name__)
+    # 获取根日志记录器
+    logger = logging.getLogger()
+    
+    # 如果已经有 handler（说明是子进程继承或重复调用），先清理掉
+    if logger.hasHandlers():
+        logger.handlers.clear()
 
+    logger.setLevel(logging.INFO) # 建议生产环境设为 INFO，DEBUG 太刷屏导致 I/O 变慢
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    # 1. 所有进程都保留 FileHandler，确保日志记录完整
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    # 2. 【核心优化】只有主进程才添加 StreamHandler
+    # 这样子进程的日志只进文件，不通过 stdout 传给父进程，彻底消除双重打印
+    if multiprocessing.current_process().name == 'MainProcess':
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    else:
+        # 子进程可以降低日志级别，减少写入压力
+        logger.setLevel(logging.WARNING)
+
+    # 返回当前模块的 logger
+    return logging.getLogger(__name__)
 
 class MetricsLogger:
     def __init__(self, args):

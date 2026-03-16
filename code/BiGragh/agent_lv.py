@@ -1,11 +1,12 @@
 import torch
-from project.memory import Memory
+from BiGragh.memory_lv import Memory
 import torch.nn.functional as F
 from torch.distributions import Categorical
 import traceback
 import logging
 import pandas as pd
 import os
+import gc
 
 def save_metrics_to_csv(metrics: dict, filepath: str):
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -41,19 +42,28 @@ class Agent:
         self.memory = Memory(self.batch_size, self.state_dims, self.device, self.logger)
 
         # Move networks to device
-        self.actor_network.to(self.device)
-        self.critic_network.to(self.device)
+        self.actor_network
+        self.critic_network
 
         # Training statistics
         self.training_step = 0
         self.update_counter = 0
 
-    def remember(self, cands_state, mip_state, node_state, action, reward, done, value, log_prob):
+    
+    def remember(self, cands_state, mip_state, node_state, norm_cons, norm_edge_idx, norm_edge_attr, norm_var, norm_bounds,action, reward, done, value, log_prob):
         try:
             self.memory.store(
                 cands_state=cands_state.detach().cpu(),
                 mip_state=mip_state.detach().cpu(),
                 node_state=node_state.detach().cpu(),
+
+                # --- 新增二分图存储 ---
+                norm_cons=norm_cons.detach().cpu(),
+                norm_edge_idx=norm_edge_idx.detach().cpu(),
+                norm_edge_attr=norm_edge_attr.detach().cpu(),
+                norm_var=norm_var.detach().cpu(),
+                norm_bounds=norm_bounds.detach().cpu(),
+
                 action=action,
                 reward=reward,
                 done=done,
@@ -118,32 +128,42 @@ class Agent:
     #         self.logger.error(traceback.format_exc())
     #         raise
 
-    # 变量截取的选择函数
-    def choose_action(self, cands_state, mip_state, node_state, padding_mask=None, deterministic=False):
+    # 变量截取的选择函数; deterministic: 是否贪心选动作（评估用）
+    def choose_action(self, cands_state, mip_state, node_state, norm_cons, norm_edge_idx, norm_edge_attr, norm_var, norm_bounds, padding_mask=None, deterministic=False):
         try:
             # Ensure inputs are tensors on correct device
             cands_state = torch.as_tensor(cands_state, dtype=torch.float32, device=self.device)
             mip_state = torch.as_tensor(mip_state, dtype=torch.float32, device=self.device)
             node_state = torch.as_tensor(node_state, dtype=torch.float32, device=self.device)
 
+            norm_cons = torch.as_tensor(norm_cons, dtype=torch.float32, device=self.device)
+            norm_edge_idx = torch.as_tensor(norm_edge_idx, dtype=torch.long, device=self.device) # 索引通常用 long
+            norm_edge_attr = torch.as_tensor(norm_edge_attr, dtype=torch.float32, device=self.device)
+            norm_var = torch.as_tensor(norm_var, dtype=torch.float32, device=self.device)
+            norm_bounds = torch.as_tensor(norm_bounds, dtype=torch.float32, device=self.device)
+
+            # if norm_bounds.dim() == 1:
+            #     norm_bounds = norm_bounds.unsqueeze(0)
+
             if cands_state.dim() == 2:
                 cands_state = cands_state.unsqueeze(0)
 
             # === 2. 核心修改：测试阶段的变量截断 (保持一致性) ===
             MAX_VARS = 400  # 必须与训练时的 MAX_VARS 相同
+            # 总候选变量数量
             num_actual_cands = cands_state.size(1)
-            # 记录原始索引，以便选出动作后能映射回原始变量
+            # 总候选变量索引[0,1,2,...]
             original_indices = torch.arange(num_actual_cands, device=self.device)
 
             if num_actual_cands > MAX_VARS:
                 # 获取分数部分特征（第 0 列）进行排序
                 scores = cands_state[0, :, 0] 
-                # 选取前 MAX_VARS 个最优质变量
+                # top_k_idx:scores最大的前MAX_VARS个变量对应的索引
                 _, top_k_idx = torch.topk(scores, k=MAX_VARS)
                 
-                # 截断特征矩阵
+                # 排序后截断特征矩阵
                 cands_state = cands_state[:, top_k_idx, :]
-                # 截断原始索引映射表
+                # 截断原始索引映射表[0,1,2,...,MAX_VARS]
                 original_indices = original_indices[top_k_idx]
                 
                 # 如果有传入 padding_mask，也需要同步截断
@@ -154,8 +174,9 @@ class Agent:
                     padding_mask = padding_mask[:, top_k_idx]
 
 
-
+            #如果是一维
             if mip_state.dim() == 1:
+                #在第 0 个位置增加一个维度
                 mip_state = mip_state.unsqueeze(0)
             if node_state.dim() == 1:
                 node_state = node_state.unsqueeze(0)
@@ -170,27 +191,33 @@ class Agent:
 
             with torch.no_grad():
                 #Actor & Critic 前向（核心）
-                action_probs = self.actor_network(cands_state, node_state, mip_state, padding_mask)
-                value = self.critic_network(cands_state, node_state, mip_state, padding_mask)
+                action_probs = self.actor_network(cands_state, node_state, mip_state,norm_cons, norm_edge_idx, norm_edge_attr, norm_var, norm_bounds,padding_mask,mb_cons_batch = None,mb_var_batch=None)
+                value = self.critic_network(cands_state, node_state, mip_state, norm_cons, norm_edge_idx, norm_edge_attr, norm_var, norm_bounds,padding_mask)
                 value = value.squeeze(-1)  # [batch]
 
                 if deterministic:
+                    #直接选择概率分布中最大的那个位置
                     action_in_truncated = action_probs.argmax(dim=-1)
                 else:
+                    if torch.isnan(action_probs).any():
+                        print("!!! Found NaN in action_probs !!!")
+                        print(f"norm_var min/max: {norm_var.min()}, {norm_var.max()}")
+                        print(f"norm_cons min/max: {norm_cons.min()}, {norm_cons.max()}")
+                        print(f"edge_index size: {norm_edge_idx.shape}")
+                    #根据概率分布进行随机采样
                     dist = Categorical(action_probs)
-                    action_in_truncated = dist.sample()
+                    #得到的是一个整数索引,这个索引就是 AI 在当前截断后的变量池（500个变量）中选中的那个位置
+                    action_in_truncated = dist.sample() 
                 log_prob = torch.log(action_probs.gather(1, action_in_truncated.unsqueeze(-1)).clamp_min(1e-12))
-                
-                
                 # if deterministic:
                 #     #测试 / 验证阶段（贪心）
-                #     action = action_probs.argmax(dim=-1) #在 动作维度 上选最大概率的索引
+                #     action = action_probs.argmax(dim=-1)
                 #     # max prob log
-                #     max_prob = action_probs.gather(1, action.unsqueeze(-1)).squeeze(-1) #取该动作的概率
-                #     log_prob = torch.log(max_prob.clamp_min(1e-12)) #计算 log probability
+                #     max_prob = action_probs.gather(1, action.unsqueeze(-1)).squeeze(-1)
+                #     log_prob = torch.log(max_prob.clamp_min(1e-12))
                 # else:
                 #     #训练阶段（探索）
-                #     dist = Categorical(action_probs) #按概率采样
+                #     dist = Categorical(action_probs)
                 #     action = dist.sample()
                 #     log_prob = dist.log_prob(action)
 
@@ -424,10 +451,12 @@ class Agent:
 
 
     def learn(self):
-        print(f"Current torch threads: {torch.get_num_threads()}")
-        data = self.memory.get_all_data()
-        # 打印当前 Memory 里的样本数量
-        print(f"DEBUG: Learning with {len(data)} transitions.")
+        # print(f"Current torch threads: {torch.get_num_threads()}")
+        # data = self.memory.get_all_data()
+        # # 打印当前 Memory 里的样本数量
+        # print(f"DEBUG: Learning with {len(data)} transitions.")
+
+        # print(f"Graph Emb shape: {graph_embedding.shape}")
         try:
             self.logger.debug("Started Learning...")
             if self.memory.is_empty():
@@ -440,8 +469,15 @@ class Agent:
 
             #从 memory 取出所有完整轨迹；这里是 on-policy、整轨迹 PPO，没有 replay 偏差
             (cands_states_list, mip_states_list, node_states_list,
-             actions_list, rewards_list, dones_list, log_probs_list, values_list) = self.memory.get_all_data()
+            norm_conss_list,      # 新增
+            norm_edge_idxs_list,   # 新增
+            norm_edge_attrs_list,  # 新增
+            norm_vars_list,       # 新增
+            norm_boundss_list,
+            actions_list, rewards_list, dones_list, log_probs_list, values_list) = self.memory.get_all_data()
 
+            print(f"DEBUG: 真正用于训练的 Step 数量是: {len(actions_list)}")
+            
             actions = torch.tensor(actions_list, dtype=torch.long, device=self.device)
             rewards = torch.tensor(rewards_list, dtype=torch.float32, device=self.device)
             dones = torch.tensor(dones_list, dtype=torch.float32, device=self.device)
@@ -454,11 +490,10 @@ class Agent:
 
             # Build padded last state to compute bootstrap
             #B&B 的 action space 是可变大小的，对最后一个 state：padding 到 max_candidates
-
             #统计全部轨迹中的最大候选变量数
             max_candidates = max(cs.size(0) for cs in cands_states_list)
             #取轨迹最后一个状态的候选集合
-            last_cs = cands_states_list[-1]
+            last_cs = cands_states_list[-1].to(self.device)
             if last_cs.size(0) < max_candidates:
                 pad = torch.zeros(max_candidates - last_cs.size(0), last_cs.size(1), device=self.device)
                 last_cs_padded = torch.cat([last_cs, pad], dim=0).unsqueeze(0)
@@ -470,19 +505,49 @@ class Agent:
                 last_cs_padded = last_cs.unsqueeze(0)
                 last_mask = torch.zeros(last_cs.size(0), dtype=torch.bool, device=self.device).unsqueeze(0)
 
-            #episode 结束 → 不 bootstrap
+            # 获取最后一个状态的二分图特征
+            last_norm_cons = self.memory.norm_conss[-1].to(self.device)
+            last_norm_edge_idx = self.memory.norm_edge_idxs[-1].to(self.device)
+            last_norm_edge_attr = self.memory.norm_edge_attrs[-1].to(self.device)
+            last_norm_var = self.memory.norm_vars[-1].to(self.device)
+            last_norm_bounds = self.memory.norm_boundss[-1].to(self.device)
+
+            #如果episode 结束, bootstrap_value=0
             if dones[-1] > 0.5:
                 bootstrap_value = torch.tensor(0.0, device=self.device)
-            #否则 → 用 critic 预测
+            #否则 → 用 critic 预测,预测轨迹尽头那个“未完待续”状态的预期收益（Bootstrap Value）
             else:
-                #bootstrap_value 是 critic 对“最后一个状态“的价值预测 
-                bootstrap_value = self.critic_network(
-                    last_cs_padded, node_states[-1:].unsqueeze(0).squeeze(0), mip_states[-1:].unsqueeze(0).squeeze(0), last_mask
-                ).squeeze(-1)[0]
+                with torch.no_grad():
+                    # 2. 统一使用切片获取最后一行，保持 (1, D) 形状
+                    last_node = node_states[-1:] # (1, hidden_dim)
+                    last_mip = mip_states[-1:]   # (1, hidden_dim)
+
+                    # 3. 调用网络
+                    v_out = self.critic_network(
+                        last_cs_padded,   # (1, N, D)
+                        last_node,        # (1, D)
+                        last_mip,         # (1, D)
+                        last_norm_cons, 
+                        last_norm_edge_idx, 
+                        last_norm_edge_attr, 
+                        last_norm_var, 
+                        last_norm_bounds,
+                        last_mask         # (1, N)
+                    )
+                    
+                    # 4. 安全提取标量
+                    bootstrap_value = v_out.view(-1)[0]
 
             #计算 GAE
             advantages, returns = self._compute_gae(rewards, old_values, dones, bootstrap_value)
+            #这个动作是否比平均预期更好
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            # === 诊断块 1：检查全局优势信号 ===
+            print(f"--- DIAGNOSIS: GAE Stats ---")
+            print(f"Advantage - Mean: {advantages.mean().item():.6f}, Std: {advantages.std().item():.6f}")
+            print(f"Returns - Mean: {returns.mean().item():.6f}, Max: {returns.max().item():.6f}")
+            # =================================
 
             total_actor_loss = 0.0
             total_critic_loss = 0.0
@@ -494,47 +559,21 @@ class Agent:
 
             
             for epoch in range(self.n_epochs):
+                
                 iter =0
                 #循环次数（打印次数） = 数据总数 / Batch Size
                 self.logger.debug(f"Epoch {epoch+1}/{self.n_epochs}")
                 for batch in self.memory.get_batch_generator(self.batch_size):
                     (mb_cands_states, mb_cands_masks, mb_mip_states, mb_node_states,
+                    mb_norm_cons, mb_norm_edge_idx, mb_norm_edge_attr, mb_norm_var, mb_norm_bounds,
+                     mb_cons_batch, mb_var_batch,
                      mb_actions, _mb_rewards, _mb_dones, mb_old_log_probs, mb_old_values, batch_indices) = batch
 
 
-                    # MAX_VARS = 500
-                    # ## 获取候选变量的分数部分（第0列特征）,维度: [Batch, Num_Candidates]
-                    # scores = mb_cands_states[:, :, 0]
-                    # if mb_cands_states.size(1) > MAX_VARS:
-                    #     # 获取前 MAX_VARS 个变量的索引
-                    #     _, top_indices = torch.topk(scores, k=MAX_VARS, dim=1)
-
-                    #     #重新排列候选变量特征 [Batch, MAX_VARS, 25]
-                    #     idx_expanded = top_indices.unsqueeze(-1).expand(-1, -1, mb_cands_states.size(-1))
-                    #     mb_cands_states = torch.gather(mb_cands_states, dim=1, index=idx_expanded)
-
-                    #     # B. 重新排列 Mask [Batch, MAX_VARS]
-                    #     mb_cands_masks = torch.gather(mb_cands_masks, dim=1, index=top_indices)
-
-                    #     #修正 mb_actions,因为排序变了，之前的动作索引 mb_actions 已经失效
-                    #     ## 我们需要找到当初选中的那个变量在“新排序”中的位置
-                    #     # 如果当初选的变量不幸被截断了，我们强制将其映射到第 0 个变量以防止溢出
-                    #     new_actions = []
-                    #     for b in range(mb_cands_states.size(0)):
-                    #         # 检查旧动作是否在新的 top_indices 中
-                    #         match = (top_indices[b] == mb_actions[b]).nonzero(as_tuple=True)[0]
-                    #         if len(match) > 0:
-                    #             new_actions.append(match[0])
-                    #         else:
-                    #             # 如果没找到（被截断了），取第0个（保底策略）
-                    #             new_actions.append(torch.tensor(0, device=self.device))
-                    #     mb_actions = torch.stack(new_actions)
-
                     iter = iter +1
                     self.logger.info(f"******iter********** : {iter}")
+                    torch.cuda.empty_cache()
                     
-                    
-
                     mb_cands_states = mb_cands_states.to(self.device)
                     mb_cands_masks = mb_cands_masks.to(self.device)
                     mb_mip_states = mb_mip_states.to(self.device)
@@ -543,16 +582,53 @@ class Agent:
                     mb_old_log_probs = mb_old_log_probs.to(self.device)
                     mb_old_values = mb_old_values.to(self.device)
 
+                    # 确保所有二分图数据在 GPU 上 (已经在 generator 处理过，这里做双重确认或处理)
+                    mb_norm_cons = mb_norm_cons.to(self.device)
+                    mb_norm_edge_idx = mb_norm_edge_idx.to(self.device)
+                    mb_norm_edge_attr = mb_norm_edge_attr.to(self.device)
+                    mb_norm_var = mb_norm_var.to(self.device)
+                    mb_norm_bounds = mb_norm_bounds.to(self.device)
+                    # 注意：GNN Policy 内部需要这两个 batch 索引来进行全局平均池化
+                    mb_cons_batch = mb_cons_batch.to(self.device)
+                    mb_var_batch = mb_var_batch.to(self.device)
+
 
                     mb_advantages = advantages[batch_indices]
                     mb_returns = returns[batch_indices]
                     mb_padding_masks = mb_cands_masks
 
-                    # print("********************************************")
-                    # print(f"DEBUG: cands_state Mean: {mb_cands_states.abs().mean().item()}")
                     
-                    action_probs = self.actor_network(mb_cands_states, mb_node_states, mb_mip_states, mb_padding_masks)
-                    
+
+                                        
+                    # action_probs = self.actor_network(mb_cands_states, mb_node_states, mb_mip_states,mb_norm_cons, mb_norm_edge_idx, mb_norm_edge_attr, mb_norm_var, mb_norm_bounds, mb_padding_masks,mb_cons_batch,mb_var_batch)
+                    # 将 610 行改为：
+                    action_probs = self.actor_network(
+                        cands_state_mat=mb_cands_states, 
+                        node_state=mb_node_states, 
+                        mip_state=mb_mip_states,
+                        norm_cons=mb_norm_cons, 
+                        norm_edge_idx=mb_norm_edge_idx, 
+                        norm_edge_attr=mb_norm_edge_attr, 
+                        norm_var=mb_norm_var, 
+                        norm_bounds=mb_norm_bounds, 
+                        padding_mask=mb_padding_masks,
+                        mb_cons_batch=mb_cons_batch, 
+                        mb_var_batch=mb_var_batch
+                    )
+                    # ==========================================
+                    # ⬇️ 插入：概率饱和度验证代码 ⬇️
+                    # ==========================================
+                    with torch.no_grad():
+                        _max_p = action_probs.max().item()
+                        _min_p = action_probs.min().item()
+                        
+                        if iter % 5 == 0:  # 限制打印频率，每 5 个 Batch 看一次
+                            print(f"DEBUG [Probs] Batch {iter} | Max Prob: {_max_p:.6f} | Min Prob: {_min_p:.6f}")
+                            if _max_p > 0.99:
+                                print("🚨 警告：出现极端概率！模型处于极度自信（饱和）状态，必然导致梯度消失！")
+                    # ==========================================
+                    # ⬆️ 插入结束 ⬆️
+                    # ==========================================
 
                     dist = Categorical(action_probs)
                     new_log_probs = dist.log_prob(mb_actions)
@@ -561,30 +637,37 @@ class Agent:
                     ratio = torch.exp(new_log_probs - mb_old_log_probs)
                     surr1 = ratio * mb_advantages
                     surr2 = torch.clamp(ratio, 1 - self.policy_clip, 1 + self.policy_clip) * mb_advantages
+                    # === 诊断块 2：检查 Ratio 和裁剪 ===
+                    with torch.no_grad():
+                        ratios = torch.exp(new_log_probs - mb_old_log_probs)
+                        clipped_mask = (ratios > (1 + self.policy_clip)) | (ratios < (1 - self.policy_clip))
+                        num_clipped = clipped_mask.sum().item()
+                        print(f"DEBUG - Batch Ratio Mean: {ratios.mean().item():.6f}, Clipped: {num_clipped}/{mb_actions.size(0)}")
+                    # =================================
                     actor_loss = -torch.min(surr1, surr2).mean()
                     actor_loss -= self.entropy_weight * entropy.mean()
 
-                    # 1. 检查是否有动作可选
-                    num_valid = (~mb_cands_masks).float().sum(dim=1).mean().item()
-                    # 2. 检查概率分布是否已经“死掉”（变成 One-hot 或者全相等）
-                    max_p = action_probs.max(dim=1)[0].mean().item()
-                    entropy_val = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=1).mean().item()
-                    print("*******************************")
-                    print(f"DEBUG: Valid Actions: {num_valid:.1f} | Max Prob: {max_p:.4f} | Entropy: {entropy_val:.4f}")
-                    print(f"DEBUG: Advantage Abs Mean: {mb_advantages.abs().mean().item():.8f}")
-
                     self.actor_optimizer.zero_grad()
                     actor_loss.backward()
+                    # === 诊断块 3：检查 Actor 梯度 ===
+                    # 注意：clip_grad_norm_ 会返回裁剪前的总梯度范数
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_network.parameters(), 1.0)
+                    if iter % 5 == 0: # 没必要每步都打，每10个 batch 打一次
+                        print(f"DEBUG - Actor Grad Norm (Original): {actor_grad_norm.item():.8f}")
+                        print(f"DEBUG - Batch {iter} | Actor Loss: {actor_loss.item():.8f}")
+                    # =================================
+                    torch.nn.utils.clip_grad_norm_(self.actor_network.parameters(), 1.0)
 
-                    # 打印 Actor 第一层或最后一层的平均梯度绝对值
-                    grads = [p.grad.abs().mean().item() for p in self.actor_network.parameters() if p.grad is not None]
-                    # print("********************************************")
-                    # print(f"DEBUG: Mean Actor Gradients: {sum(grads)/len(grads) if grads else 0}")
-
-                    # torch.nn.utils.clip_grad_norm_(self.actor_network.parameters(), 10.0)
+                    before_sum = sum(p.sum().item() for p in self.actor_network.parameters())
                     self.actor_optimizer.step()
 
-                    values = self.critic_network(mb_cands_states, mb_node_states, mb_mip_states, mb_padding_masks)
+                    after_sum = sum(p.sum().item() for p in self.actor_network.parameters())
+                    if iter % 5 == 0:
+                        print(f"DEBUG - Batch {iter} | Weight Sum Diff: {abs(after_sum - before_sum):.8f}")
+
+                  
+
+                    values = self.critic_network(mb_cands_states, mb_node_states, mb_mip_states,mb_norm_cons, mb_norm_edge_idx, mb_norm_edge_attr, mb_norm_var, mb_norm_bounds, mb_padding_masks,mb_cons_batch,mb_var_batch)
                     values = values.view(-1)
                     mb_returns = mb_returns.view(-1)
                     critic_loss = F.mse_loss(values, mb_returns)
@@ -602,21 +685,26 @@ class Agent:
                     approx_kl = 0.0
                     if num_updates > 0:
                         with torch.no_grad():
-                            last_action_probs = self.actor_network(mb_cands_states, mb_node_states, mb_mip_states, mb_padding_masks)
+                            last_action_probs = self.actor_network(mb_cands_states, mb_node_states, mb_mip_states, mb_norm_cons, mb_norm_edge_idx, 
+                                                                mb_norm_edge_attr, mb_norm_var, mb_norm_bounds,mb_padding_masks,mb_cons_batch=mb_cons_batch,  mb_var_batch=mb_var_batch)
                             last_dist = Categorical(last_action_probs)
                             last_log_probs = last_dist.log_prob(mb_actions)
-                            approx_kl = (mb_old_log_probs - last_log_probs).mean().item()
+                            # approx_kl = (mb_old_log_probs - last_log_probs).mean().item()
+                            log_ratio = last_log_probs - mb_old_log_probs
+                            approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean().item()
 
 
                     # 1. 及时删除损失和概率张量
                     del action_probs, dist, new_log_probs, ratio, actor_loss, critic_loss, values
+                    del mb_norm_cons, mb_norm_edge_idx, mb_norm_edge_attr, mb_norm_var, mb_norm_bounds
+                    del mb_cons_batch, mb_var_batch
                     del mb_cands_states, mb_cands_masks, mb_mip_states, mb_node_states
-                    # del surr1, surr2, entropy, mb_advantages, mb_returns
+                    del surr1, surr2, entropy, mb_advantages, mb_returns
                     # 释放当前 mini-batch 产生的显存碎片
                     torch.cuda.empty_cache()
 
             # Clear memory after updates
-            self.memory.clear()
+           
             self.update_counter += 1
 
             advantage_std = advantages.std().item()
@@ -648,7 +736,8 @@ class Agent:
             # del actions, rewards, dones, old_values, old_log_probs, advantages, returns
 
             # 2. 强制回收 Python 垃圾
-            import gc
+            self.memory.clear()
+            
             gc.collect()
 
             # 3. 释放 PyTorch 预留但未使用的显存
@@ -664,7 +753,7 @@ class Agent:
                 f"Return: {metrics['episode_return']:.2f}"
             )
 
-            # save_metrics_to_csv(metrics, filepath="output/training_metrics.csv")
+            # save_metrics_to_csv(metrics, filepath="bi_output/training_metrics.csv")
             return metrics
         except Exception as e:
             self.logger.error(f"Error in learn: {e}")
