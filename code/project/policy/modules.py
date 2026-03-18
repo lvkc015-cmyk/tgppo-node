@@ -109,14 +109,14 @@ class TreeGateBranchingNet(nn.Module):
         self.feature_net = nn.Sequential(
             nn.Linear(branch_size, hidden_size),
             nn.LayerNorm(hidden_size),
-            nn.ReLU(True),
+            nn.GELU(),
             nn.Linear(hidden_size, hidden_size)
         )
         
         # 2. Tree Gate 生成器 (生成一层的全局注意力权重)
         self.gate_net = nn.Sequential(
             nn.Linear(tree_state_size, hidden_size),
-            nn.ReLU(True),
+            nn.GELU(),
             nn.Linear(hidden_size, hidden_size),
             nn.Sigmoid() # 限制在 0-1 之间作为门控开关
         )
@@ -124,7 +124,7 @@ class TreeGateBranchingNet(nn.Module):
         # 3. 最终打分层 (平滑降维输出标量分数，不加 LayerNorm)
         self.scoring_layer = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(True),
+            nn.GELU(),
             nn.Linear(hidden_size // 2, 1)
         )
 
@@ -137,7 +137,7 @@ class TreeGateBranchingNet(nn.Module):
         gate = self.gate_net(tree_state).unsqueeze(1)
         
         # 3. Tree Gating 核心机制：用当前的树状态去“过滤/激活”候选变量特征
-        gated_cands = (cands_feat * gate) + + cands_feat
+        gated_cands = (cands_feat * gate) +  cands_feat
         
         # 4. 独立打分: [B, L, 1] -> [B, L]
         scores = self.scoring_layer(gated_cands).squeeze(-1)
@@ -157,17 +157,17 @@ class BiMatchingNet(nn.Module):
         self.linear3_1 = nn.Linear(hidden_size, hidden_size)
         self.linear3_2 = nn.Linear(hidden_size, hidden_size)
 
-    def forward(self, tree_feat, var_feat, padding_mask):
+    def forward(self, tree_feat, cand_feat, padding_mask):
         """
         tree_feat: [B, E]
         var_feat:  [B, L, E]
         padding_mask: [B, L] True for pads; may be None
         """
-        B, L, E = var_feat.shape
+        B, L, E = cand_feat.shape
         # 不同样本的候选变量数 L 不一样,为了 batch 计算，短的要补 0,padding 的位置不能参与注意力计算
         #True:这个位置是 padding（无效）
         if padding_mask is None:
-            padding_mask = torch.zeros((B, L), dtype=torch.bool, device=var_feat.device)
+            padding_mask = torch.zeros((B, L), dtype=torch.bool, device=cand_feat.device)
 
         #给 tree_feat 在 第 1 个维度 插入一个长度为 1 的维度
         tree_feat = tree_feat.unsqueeze(1)  # [B,1,E]
@@ -176,19 +176,19 @@ class BiMatchingNet(nn.Module):
         #[B,1,E] × [B,E,L] → [B,1,L]
         #.squeeze(1)：[B,1,L] → [B,L]
         #当前树状态下，每个变量和树的“相似度 / 相关度”
-        G_tc = torch.bmm(self.linear1_1(tree_feat), var_feat.transpose(1, 2)).squeeze(1)  # [B, L]
+        G_tc = torch.bmm(self.linear1_1(tree_feat), cand_feat.transpose(1, 2)).squeeze(1)  # [B, L]
         #padding 的位置填成 -∞，后面 softmax 后 = 0，padding 变量不会被关注
         G_tc = G_tc.masked_fill(padding_mask, float('-inf'))
         #得到一个 概率分布，树状态认为“哪个变量更重要”
         G_tc = F.softmax(G_tc, dim=1).unsqueeze(1)  # [B,1,L]
 
         #这次是反过来：每个变量怎么看当前的树状态？
-        G_ct = torch.bmm(self.linear1_2(var_feat), tree_feat.transpose(1, 2)).squeeze(2)  # [B,L]
+        G_ct = torch.bmm(self.linear1_2(cand_feat), tree_feat.transpose(1, 2)).squeeze(2)  # [B,L]
         G_ct = G_ct.masked_fill(padding_mask, float('-inf'))
         G_ct = F.softmax(G_ct, dim=1).unsqueeze(2)  # [B,L,1]
 
         #用注意力加权平均所有变量，“在当前树状态下，最重要的变量长什么样”
-        E_t = torch.bmm(G_tc, var_feat)              # [B,1,E]
+        E_t = torch.bmm(G_tc, cand_feat)              # [B,1,E]
         #每个变量得到一个“定制版”的树特征
         E_c = torch.bmm(G_ct, tree_feat)             # [B,L,1] x [B,1,E] -> [B,L,E]
 
@@ -205,5 +205,5 @@ class BiMatchingNet(nn.Module):
         # 🚨 终极修复：把变量自己的特征加回来！(残差连接)
         # 这样网络既拥有了宏观的树视角，又保留了每个变量自己的独立特性
         # ==========================================
-        out_feat = var_feat + M_tc
+        out_feat = cand_feat + M_tc
         return out_feat

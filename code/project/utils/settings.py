@@ -120,5 +120,6 @@ scip_limits = {
 state_dims = {
     'var_dim': 25,
     'node_dim': 8,
-    'mip_dim': 53
+    'mip_dim': 53,
+    "node_cand_dim": 6 # 新增：代表你为 Open Nodes 提取的特征 (LB, Est, Depth)
 }
