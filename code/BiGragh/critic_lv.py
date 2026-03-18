@@ -17,10 +17,12 @@ class Critic(nn.Module):
         self.var_embedding = nn.Sequential(
             nn.LayerNorm(var_dim),
             nn.Linear(var_dim, hidden_dim),
+            nn.GELU()
         )
         self.tree_embedding = nn.Sequential(
             nn.LayerNorm(node_dim + mip_dim + 15),
             nn.Linear(node_dim + mip_dim + 15, hidden_dim),
+            nn.GELU()
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -37,7 +39,7 @@ class Critic(nn.Module):
 
         self.aggregation = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
@@ -52,7 +54,7 @@ class Critic(nn.Module):
         # )
         self.value_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(True),
+            nn.GELU(),
             nn.Linear(hidden_dim // 2, 1)
         )
 

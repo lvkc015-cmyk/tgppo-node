@@ -98,16 +98,7 @@ class GNNPolicy(torch.nn.Module):
         ])
 
 
-        #double check
- 
-        # self.convs = []
         
-        # self.conv1 = GraphConv((emb_size, emb_size), hidden_dim1 )
-        # self.conv2 = GraphConv((hidden_dim1, hidden_dim1), hidden_dim2 )
-        # self.conv3 = GraphConv((hidden_dim2, hidden_dim2), hidden_dim3 )
-        
-        # self.convs = [ self.conv1, self.conv2, self.conv3 ]
-
         # 4. 投影层 (Projection Layer)
         # 输入维度 = 变量池化(hidden_dim3) + 约束池化(hidden_dim3) + 边界特征(8)
         combined_input_dim = hidden_dim3 + hidden_dim3 + 2
@@ -117,12 +108,7 @@ class GNNPolicy(torch.nn.Module):
             nn.ReLU()
         )
         
-        # out_size = hidden_dim3 if len(self.convs)==3 else emb_size
         
-        # self.final_mlp = torch.nn.Sequential( 
-        #                     torch.nn.Linear(2*out_size+2, 1, bias=False),
-        #                     torch.nn.Sigmoid()
-        #                     )
            
        
     def forward_graph(self, constraint_features, edge_indices, edge_features, 
@@ -144,10 +130,7 @@ class GNNPolicy(torch.nn.Module):
         edge_indices = edge_indices.contiguous()
         bbounds = bbounds.contiguous()
         
-        # if constraint_batch is not None:
-        #     constraint_batch = constraint_batch.contiguous().long()
-        # if variable_batch is not None:
-        #     variable_batch = variable_batch.contiguous().long()
+       
 
         # 1. 嵌入层投影
         variable_features = self.var_embedding(variable_features) #[6048, 32]
@@ -155,21 +138,7 @@ class GNNPolicy(torch.nn.Module):
         edge_features = self.edge_embedding(edge_features) #[14672,1]
         bbounds = self.bounds_embedding(bbounds) # 此时 bbounds 维度为 [B, 2] = [16, 2]
         
-        # print("111111111111111111111111111111111")
-        # print(f"DEBUG: constraint_features shape: {constraint_features.shape}")
-        # print(f"DEBUG: variable_features shape: {variable_features.shape}")
-        # print(f"DEBUG: edge_indices shape: {edge_indices.shape}")
-        # print(f"DEBUG: edge_features shape: {edge_features.shape}")
-        # print(f"DEBUG: bbounds shape: {bbounds.shape}")   
-
-        # num_vars = variable_features.size(0)  # 应该是 6048
-        # num_cons = constraint_features.size(0) # 应该是 3744
-        # max_var_idx = edge_indices[0].max() # Var -> Cons，假设 0 维是 Var
-        # max_cons_idx = edge_indices[1].max()
-
-        # print(f"--- Edge Index Integrity Check ---")
-        # print(f"Total Vars: {num_vars}, Max Var Index in Edges: {max_var_idx}")
-        # print(f"Total Cons: {num_cons}, Max Cons Index in Edges: {max_cons_idx}")
+        
         
         # 2. 准备反向边索引（用于双向消息传递）
         ## edge_indices: [2, 14672] 第一行是变量索引，第二行是约束索引
@@ -178,67 +147,23 @@ class GNNPolicy(torch.nn.Module):
 
         for conv_v2c, conv_c2v in zip(self.convs_v2c, self.convs_c2v):
             # Var -> Cons      constraint_features_next: [3744, 16]
-            constraint_features_next = F.relu(conv_v2c((variable_features, constraint_features), 
+            constraint_features_next = F.gelu(conv_v2c((variable_features, constraint_features), 
                                                 edge_indices,
                                                 edge_weight=edge_features))
             # Cons -> Var   variable_features: [6048, 16]
-            variable_features = F.relu(conv_c2v((constraint_features, variable_features), 
+            variable_features = F.gelu(conv_c2v((constraint_features, variable_features), 
                                               edge_indices_reversed,
                                               edge_weight=edge_features))
 
             constraint_features = constraint_features_next # [3744, 16]
-        # 3. GNN 卷积循环
-        # for conv in self.convs:
-            
-        #     #Var to cons
-        #     constraint_features_next = F.relu(conv((variable_features, constraint_features), 
-        #                                       edge_indices,
-        #                                       edge_weight=edge_features,
-        #                                       size=(variable_features.size(0), constraint_features.size(0))))
-            
-        #     #cons to var 
-        #     variable_features = F.relu(conv((constraint_features, variable_features), 
-        #                               edge_indices_reversed,
-        #                               edge_weight=edge_features,
-        #                               size=(constraint_features.size(0), variable_features.size(0))))
-            
-            # constraint_features = constraint_features_next
-        # print("222222222222222222222222222222")
-        # print(f"DEBUG: constraint_features shape: {constraint_features.shape}")
-        # print(f"DEBUG: variable_features shape: {variable_features.shape}")
-        # print(f"DEBUG: edge_indices shape: {edge_indices.shape}")
-        # print(f"DEBUG: edge_features shape: {edge_features.shape}")
-        # print(f"DEBUG: bbounds shape: {bbounds.shape}")   
-
-        # DEBUG: constraint_features shape: torch.Size([3744, 16])
-        # DEBUG: variable_features shape: torch.Size([6048, 16])
-        # DEBUG: edge_indices shape: torch.Size([2, 14672])
-        # DEBUG: edge_features shape: torch.Size([14672, 1])
-        # DEBUG: bbounds shape: torch.Size([16, 2])
-
-        # num_vars = variable_features.size(0)  # 应该是 6048
-        # num_cons = constraint_features.size(0) # 应该是 3744
-        # max_var_idx = edge_indices[0].max() # Var -> Cons，假设 0 维是 Var
-        # max_cons_idx = edge_indices[1].max()
-
-        # print(f"--- Edge Index Integrity Check ---")
-        # print(f"Total Vars: {num_vars}, Max Var Index in Edges: {max_var_idx}")
-        # print(f"Total Cons: {num_cons}, Max Cons Index in Edges: {max_cons_idx}")
+       
         
         # 4. 全局池化
         # 4. 全局池化 (修正版)
         if constraint_batch is not None and variable_batch is not None:
-            # constraint_batch = constraint_batch.to(constraint_features.device).long().contiguous()
-            # variable_batch = variable_batch.to(variable_features.device).long().contiguous()
-            # batch_size = bbounds.size(0)
-            # 使用 global_mean_pool，参数顺序是 (特征, batch索引)
-            # 结果形状自动为 [Batch_Size, Hidden]
-            ## 输出: [16, 16]  # 16个图，每个图16维特征
+           
             constraint_avg = torch_geometric.nn.global_mean_pool(constraint_features, constraint_batch)
-            # 输入: constraint_features [3744, 16], constraint_batch [3744]
-            # 操作: 按batch索引分组，每组取平均
-            # 应该输出: [16, 16]  # 16个图，每个图16维特征
-            # 实际输出却是 [32765, 16]
+           
             variable_avg = torch_geometric.nn.global_mean_pool(variable_features, variable_batch)
 
             
@@ -253,10 +178,7 @@ class GNNPolicy(torch.nn.Module):
         if bbounds.dim() == 1:
             bbounds = bbounds.unsqueeze(0)
 
-        # print("333333333333333333333333333333333")
-        # print(f"DEBUG - var_avg: {variable_avg.shape}")
-        # print(f"DEBUG - cons_avg: {constraint_avg.shape}")
-        # print(f"DEBUG - bbounds: {bbounds.shape}")
+        
         combined = torch.cat((variable_avg, constraint_avg, bbounds), dim=1)   # [16, 34]
         # print(f"DEBUG: combined shape: {combined.shape}")
         
