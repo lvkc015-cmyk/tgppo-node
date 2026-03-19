@@ -1,12 +1,9 @@
-
-
-
+import os
 import torch
 import numpy as np
 import time
 import gc
 from collections import OrderedDict
-
 
 class LPFeatureRecorder():
     #model：SCIP 模型;  device：GNN 使用的设备（CPU / GPU）
@@ -99,125 +96,19 @@ class LPFeatureRecorder():
             self.cons_to_coeffs[c_name] = clean_coeffs
             self.cons_to_nz_count[c_name] = len(v_names)
 
-        # 在初始化时，直接构建全局静态根图！   
-        self.root_graph = self._build_global_root_graph(model)
-        self.recorded[1] = self.root_graph
 
-            
+           
         
-    # 【新增方法】：一次性构建全局二分图
-    def _build_global_root_graph(self, model):
-        dev = self.device
-        #筛选线性约束
-        linear_conss = [c for c in self.original_conss if c.isLinear()]
-        n_vars = len(self.varrs)
-        n_conss = len(linear_conss)
-        
-        graph = BipartiteGraphStatic0(n_vars, n_conss, dev, allocate=True)
-        
-        # 1. 建立“连续索引映射” (必须连续 0~N-1)
-        var2local = {v.name: i for i, v in enumerate(self.varrs)}
-        cons2local = {c.name: i for i, c in enumerate(linear_conss)}
-        
-        # 2. 填充全局变量初始特征
-        for i, var in enumerate(self.varrs):
-            graph.var_attributes[i] = self._get_feature_var(model, var, dev)
-            
-        # 3. 填充全局约束特征 & 构建全局边
-        edge_indices = []
-        edge_values = []
-        for i, cons in enumerate(linear_conss):
-            graph.cons_attributes[i] = self._get_feature_cons(model, cons, dev)
-            
-            # 连边
-            for v_name, val in self.cons_to_coeffs.get(cons.name, {}).items():
-                # 兼容你以前的命名逻辑
-                clean_name = v_name[2:] if v_name.startswith("t_") else v_name
-                if clean_name in var2local:
-                    edge_indices.append([var2local[clean_name], i])
-                    edge_values.append(val)
-                    
-        # 4. 转换并压缩边矩阵
-        if edge_indices:
-            graph.local_edge_index = torch.tensor(edge_indices, dtype=torch.long, device=dev).t().contiguous()
-            raw_edge_attr = torch.tensor(edge_values, dtype=torch.float32, device=dev).unsqueeze(1)
-            graph.local_edge_attr = torch.sign(raw_edge_attr) * torch.log1p(torch.abs(raw_edge_attr))
-            
-        return graph
-    
-    #极速获取结点的子图
-    def record_sub_milp_graph(self, model, sub_milp, cands=None, k_hops=None):
-        # 1. 如果已经记录过，直接返回
-        node_num = sub_milp.getNumber()
-        if node_num in self.recorded:
-            return
 
-        # 2. 找到父结点的图（递归溯源，直到根图）
-        parent = sub_milp.getParent()
-        if parent is None:
-            # 万一它是根结点（理论上 __init__ 里已经建了，这是兜底）
-            graph = self.root_graph.copy()
-        else:
-            parent_num = parent.getNumber()
-            if parent_num not in self.recorded:
-                self.record_sub_milp_graph(model, parent)  # 递归构建父图
-            # 从父图极速拷贝（共享边和约束，只拷贝变量矩阵）
-            graph = self.recorded[parent_num].copy()
-
-        # 3. 极速状态注入：只更新发生了 Branching 的那个变量的 Bound！
-        self._change_branched_bounds_global(graph, sub_milp)
-
-        # 4. 存入内存库
-        self.recorded[node_num] = graph
-
-
-    # 把当前节点的 branching 决策（变量上下界变化）写进 graph 的变量特征里
-    # sub_milp表示 当前 B&B 节点
-    def _change_branched_bounds_global(self, graph, sub_milp):
-        branchings = sub_milp.getParentBranchings()
-        if branchings is None: 
-            return
-            
-        bvars, bbounds, btypes = branchings ## 被分支的变量，分支值，类型（lower / upper）
-        SCIP_INF = 1e7
-        
-        # 我们用 self.varrs 里的顺序作为全局矩阵的行索引
-        var2local = {v.name: i for i, v in enumerate(self.varrs)}
-        
-        for bvar, bbound, btype in zip(bvars, bbounds, btypes):
-            name = bvar.name
-            clean_name = name[2:] if name.startswith("t_") else name
-            
-            global_idx = var2local.get(clean_name)
-            
-            if global_idx is not None:
-                val = bbound
-                #判断是否“无穷 bound”
-                if btype == 0: # SCIP_BOUNDTYPE_LOWER
-                    is_inf = 1 if val <= -SCIP_INF else 0
-                else:          # SCIP_BOUNDTYPE_UPPER
-                    is_inf = 1 if val >= SCIP_INF else 0
-
-                clean_val = val if not is_inf else 0.0
-
-                # 写入到 10 维特征矩阵中
-                target_val_col = int(btype) + 1  # 1 为 lb, 2 为 ub
-                target_flag_col = int(btype) + 3 # 3 为 is_lb_inf, 4 为 is_ub_inf
-                
-                # 更新特征并进行 log 压缩处理
-                raw_tensor = torch.tensor([clean_val], device=self.device)
-                log_val = torch.sign(raw_tensor) * torch.log1p(torch.abs(raw_tensor))
-                
-                graph.var_attributes[global_idx, target_val_col] = log_val[0]
-                graph.var_attributes[global_idx, target_flag_col] = float(is_inf)
-
-
+       
     def clear(self):
         self.recorded.clear()
         self.recorded_light.clear()
         self.all_conss_blocks.clear()
         self.all_conss_blocks_features.clear()
         gc.collect()
+
+
         
     #获取某个节点的图
     #sub_milp: SCIP 的某个 B&B 节点
@@ -234,30 +125,33 @@ class LPFeatureRecorder():
             return self.recorded[ sub_milp_number ]
         
 
-    # def record_sub_milp_graph(self, model, sub_milp, cands=None, k_hops=2):
+    def record_sub_milp_graph(self, model, sub_milp, cands=None, k_hops=2,task='node_select'):
        
-    #     if sub_milp.getNumber() in self.recorded:
-    #         return
+        if sub_milp.getNumber() in self.recorded:
+            return
 
-    #     # 如果极端情况下 cands 为 None (例如 SCIP 初始状态)，我们主动获取一次种子
-    #     if cands is None:
-    #         print("候选变量为空")
-    #         cands, _, _ = model.getCandsState(self.var_dim, self.branch_count)
-    #         # 如果依然拿不到，截取前 100 个变量作为兜底种子（防止程序崩溃）
-    #         if not cands:
-    #             cands = model.getVars()[:100]
-    #         else:
-    #             cands = cands[:400] # 强制执行 400 种子截断
+        if task == 'node_select':
+            cands = None 
+        else:
+            # 如果极端情况下 cands 为 None (例如 SCIP 初始状态)，我们主动获取一次种子
+            if cands is None:
+                print("候选变量为空")
+                cands, _, _ = model.getCandsState(self.var_dim, self.branch_count)
+                # 如果依然拿不到，截取前 100 个变量作为兜底种子（防止程序崩溃）
+                if not cands:
+                    cands = model.getVars()[:100]
+                else:
+                    cands = cands[:400] # 强制执行 400 种子截断
 
-    #     # 此时产生的 graph 对象的维度是 [N_local]，索引是 [0...N_local-1]
-    #     graph = self._extract_khop_manual(model, sub_milp, cands, k_hop=k_hops)
+        # 此时产生的 graph 对象的维度是 [N_local]，索引是 [0...N_local-1]
+        graph = self._extract_khop_manual(model, sub_milp, cands, k_hop=k_hops,task=task)
 
-    #     self.recorded[sub_milp.getNumber()] = graph
-        # self.recorded_light[sub_milp.getNumber()] = (graph.var_attributes, graph.cons_block_idxs)
+        self.recorded[sub_milp.getNumber()] = graph
+       
 
     
 
-    def _extract_khop_manual(self, model, sub_milp, cands, k_hop=2, max_edges=30000):
+    def _extract_khop_manual(self, model, sub_milp, cands, k_hop=2, max_edges=30000,task='node_select'):
         def clean_name(v_name):
             return v_name[2:] if v_name.startswith("t_") else v_name
 
@@ -267,12 +161,44 @@ class LPFeatureRecorder():
         # 存放选中的约束
         selected_conss_dict = {} 
         # 当前变量字典:{全局索引:变量对象}
-        current_vars_dict = {v.getIndex(): v for v in cands}
+        
         total_edges = 0
         limit_reached = False #是否截断
 
         # SCIP 无穷大定义
         SCIP_INF = model.infinity()
+
+        # 根据任务类型动态确定 K-hop 的起点 (Seed Variables)
+        current_vars_dict = {}
+        if task == 'node_select':
+            # 【节点选择模式】：全局寻找最紧的约束 (Active Constraint Sampling)
+            scored_conss = []
+            for cons in self.original_conss:
+                if not cons.isLinear(): continue
+                activity = model.getActivity(cons)
+                lhs, rhs = model.getLhs(cons), model.getRhs(cons)
+                
+                dist_lhs = abs(activity - lhs) if lhs > -SCIP_INF else float('inf')
+                dist_rhs = abs(activity - rhs) if rhs < SCIP_INF else float('inf')
+                score = min(dist_lhs, dist_rhs)
+                scored_conss.append((score, cons))
+                
+            # 按紧迫度从小到大排序
+            scored_conss.sort(key=lambda x: x[0])
+            
+            # 取最紧的前 N 个约束作为图的骨架起点 (比如前 300 个)
+            seed_conss = [c for s, c in scored_conss[:150]]
+            
+            # 从这些核心约束反推出起步变量
+            for cons in seed_conss:
+                for v_name in self.cons_to_vars.get(cons.name, []):
+                    v_obj = self.name_to_var.get(clean_name(v_name))
+                    if v_obj: current_vars_dict[v_obj.getIndex()] = v_obj
+        else:
+            # 【变量选择模式】：依然以 cands 为起点
+            current_vars_dict = {v.getIndex(): v for v in cands} if cands else {}
+
+        seed_variables = list(current_vars_dict.values())
 
         # for 循环:从一批起始变量出发，按“变量 → 约束 → 变量 → …”的方式，做一个有边数上限的 K-hop 子图扩张
         # 得到一组 “被选中的约束集合 selected_conss_dict,并且满足边数不超过 max_edges。
@@ -293,6 +219,20 @@ class LPFeatureRecorder():
                 for cons in related_conss:
                     if cons.name not in selected_conss_dict:
                         new_conss_dict[cons.name] = cons
+            
+            # 计算新增边的数量  
+            # current_hop_edges = sum(self.cons_to_nz_count.get(c.name, 0) for c in new_conss_dict.values())
+            # current_hop_edges = sum(len(model.getValsLinear(c)) for c in new_conss_dict.values())
+            
+            # 如果这一步加进来会超过阈值，则停止扩张
+            # if total_edges + current_hop_edges > max_edges:
+            #     print(f"Warning: K-Hop truncated at step {i} to avoid OOM (Total Edges: {total_edges})")
+            #     break
+
+            # # 更新已选约束
+            # selected_conss_dict.update(new_conss_dict)
+            # total_edges += current_hop_edges
+
 
             # 我们给每个新发现的约束计算一个得分，得分越低（越接近 0）说明越紧，越优先
             scored_conss = []
@@ -328,6 +268,27 @@ class LPFeatureRecorder():
             if limit_reached:
                 break
 
+            # current_hop_conss = list(new_conss_dict.values())
+            # limit_reached = False
+            
+            # for cons in current_hop_conss:
+            #     nz = self.cons_to_nz_count.get(cons.name, 0)
+                
+            #     # 策略：i==0 是保底逻辑，必须让种子变量有约束连；i>0 则受 max_edges 限制
+            #     if i == 0 or (total_edges + nz <= max_edges):
+            #         if cons.name not in selected_conss_dict:
+            #             selected_conss_dict[cons.name] = cons
+            #             total_edges += nz
+            #     else:
+            #         print(f"Warning: K-Hop truncated at step {i} (Total Edges: {total_edges})")
+            #         limit_reached = True
+            #         break # 停止当前 Hop 的继续添加
+            
+            # if limit_reached:
+            #     break # 停止后续 Hop 的扩张
+
+            
+
             # 如果还没到最后一步，则寻找 约束 -> 变量 (偶数步)
             if i < k_hop - 1:
                 next_vars_dict = {}
@@ -344,7 +305,7 @@ class LPFeatureRecorder():
         # --- 步骤 2: 同步补齐变量 (严格限制，防止变量节点撑爆) ---
         #创建一个“有顺序的字典”，用来按插入顺序存变量 把候选变量作为“核心变量”
         final_vars_dict = OrderedDict()
-        for v in cands:
+        for v in seed_variables:
             final_vars_dict[v.getIndex()] = v
 
         #补齐所有与已选约束相关的变量,从约束反向补变量（保证连通）
@@ -414,14 +375,26 @@ class LPFeatureRecorder():
             graph.local_edge_index = torch.empty((2, 0), dtype=torch.long, device=dev)
             graph.local_edge_attr = torch.empty((0, 1), dtype=torch.float32, device=dev)
 
-        
+        # 将约束特征也挂载到 graph 上
+        # graph.local_cons_feats = graph.cons_attributes
+        # graph.local_var_feats = graph.var_attributes
+
         return graph
+
+
+    
 
     # 把“选中的变量 / 约束”映射到一个紧凑的局部编号空间，并只为它们计算特征，填进图里。
     def _add_selected_entities_to_graph(self, graph, model, selected_vars, selected_conss, device):
        
         dev = device if device else self.device
         
+        # 1. 建立变量的局部映射,重新从0开始编号,比如
+        # var_global_to_local = {
+        #     17(全局索引): 0(现在的编号),
+        #     203: 1,
+        #     5: 2
+        # }
         var_global_to_local = {v.getIndex(): i for i, v in enumerate(selected_vars)}
         # 2. 建立约束的局部映射,全局名字:索引编号
         cons_global_to_local = {c.name: i for i, c in enumerate(selected_conss)}
@@ -466,6 +439,7 @@ class LPFeatureRecorder():
             
         return var_global_to_local, cons_global_to_local
 
+    
 
     def _add_conss_to_graph(self, graph, model, conss, device=None):
         
@@ -508,9 +482,11 @@ class LPFeatureRecorder():
 
     def _change_branched_bounds_local(self, graph, sub_milp, var_map):
         # 1.  被分支的变量对象  分支设置的 bound 值  分支类型
-        bvars, bbounds, btypes = sub_milp.getParentBranchings()
+        branchings = sub_milp.getParentBranchings()
+        if branchings is None:
+            return
         SCIP_INF = 1e7
-        
+        bvars, bbounds, btypes = branchings
         for bvar, bbound, btype in zip(bvars, bbounds, btypes):
             name = bvar.name
             
@@ -548,6 +524,42 @@ class LPFeatureRecorder():
                     graph.var_attributes[local_idx, 9] = float(is_s_inf)
 
 
+                    
+            
+    #于给单个约束 cons 提取特征
+    # def _get_feature_cons(self, model, cons, device=None):
+        
+    #     dev = device if device != None else self.device
+        
+    #     try:
+            
+    #         cons_n = str(cons) #把约束转换为字符串
+    #         if re.match('flow', cons_n): #如果约束名字以 "flow" 开头
+                
+    #             rhs = model.getRhs(cons) #获取右端项 RHS
+    #             leq = 0
+    #             eq = 1  #表示该约束是等式约束
+    #             geq = 0
+    #         elif re.match('arc', cons_n): #如果约束名字以 "arc" 开头
+    #             rhs = 0  #RHS 固定设为 0
+    #             leq = eq =  1
+    #             geq = 0
+                
+    #         else:
+    #             rhs = model.getRhs(cons)
+    #             leq = eq = 1
+    #             geq = 0
+    #     except:
+    #         'logicor no repr'
+    #         rhs = 0
+    #         leq = eq = 1
+    #         geq = 0
+        
+    #     # 在 return 前添加
+    #     # if rhs > 1e15:
+    #     #     print(f"!!! 捕捉到无穷大 RHS: 约束名={cons.name}, RHS={rhs}")
+    #     #返回约束特征张量
+    #     return torch.tensor([ rhs, leq, eq, geq ], device=dev).float()
 
     def _get_feature_cons(self, model, cons, device=None):
         dev = device if device is not None else self.device
@@ -583,11 +595,33 @@ class LPFeatureRecorder():
         idx_to_log = [0, 1]
         res[idx_to_log] = torch.sign(res[idx_to_log]) * torch.log1p(torch.abs(res[idx_to_log]))
             
-       
+        # except Exception:
+        #     # 默认兜底为等式 0
+        #     clean_lhs, clean_rhs, is_geq, is_leq, is_eq, is_range = 0.0, 0.0, 0, 0, 1, 0
+
         # 返回 6 维特征
         return res
 
-   
+    #提取单个变量 var 的特征向量
+    # def _get_feature_var(self, model, var, device=None):
+        
+    #     dev = device if device != None else self.device
+    #     #获取变量的原始下界和上界
+    #     lb, ub = var.getLbOriginal(), var.getUbOriginal()
+        
+    #     #裁剪，防止数据过大
+    #     if lb <= - 0.999e+20:
+    #         lb = -300
+    #     if ub >= 0.999e+20:
+    #         ub = 300
+        
+    #     #获取该变量在目标函数中的系数
+    #     objective_coeff = model.getObjective()[var]
+    #     #获取变量类型的 one-hot 编码，One-hot 编码将变量类型表示为一个长度为 3 的向量，其中只有对应其类型的位为 1，其余位为 0
+    #     binary, integer, continuous = self._one_hot_type(var)
+    
+        
+    #     return torch.tensor([ lb, ub, objective_coeff, binary, integer, continuous ], device=dev).float()
 
     def _get_feature_var(self, model, var, device=None):
         dev = device if device is not None else self.device
@@ -639,36 +673,78 @@ class LPFeatureRecorder():
         return binary, integer,  continuous
         
         
+#用来表示 二部图中“静态不变”的那一部分结构       
+# class BipartiteGraphStatic0():
+    
+#     #Defines the structure of the problem solved. Invariant toward problems
+#     #n0：变量数量
+#     #d0=9：变量特征维度
+#     #d1=6：约束特征维度
+#     #allocate：是否立刻分配内存
+#     def __init__(self, n0, device, d0=9, d1=6, allocate=True):
+        
+#         self.n0, self.d0, self.d1 = n0, d0, d1
+#         self.device = device
+        
+#         if allocate:
+#             self.var_attributes = torch.zeros(n0,d0, device=self.device)
+#             self.cons_block_idxs = []
+#         else:
+#             self.var_attributes = None
+#             self.cons_block_idxs = None
+    
+#     #定义一个 浅结构 + 深数据 的拷贝方法，用于搜索树展开
+#     def copy(self):
+        
+#         #创建一个新的 BipartiteGraphStatic0 对象，不分配内存
+#         copy = BipartiteGraphStatic0(self.n0, self.device, allocate=False)
+        
+#         copy.var_attributes = self.var_attributes.clone()
+#         copy.cons_block_idxs = self.cons_block_idxs #no scip bonds
+        
+#         return copy
 
 class BipartiteGraphStatic0():
-    def __init__(self, n_vars, n_conss, device, d0=10, d1=6, allocate=True):
-        self.n_vars = n_vars
-        self.n_conss = n_conss
-        self.d0, self.d1 = d0, d1 #d0:变量维度，d1：约束维度
+    def __init__(self, n0, device, d0=10, d1=6, allocate=True):
+        self.n0, self.d0, self.d1 = n0, d0, d1
         self.device = device
         
+        # 记录约束数量（在 K-Hop 中，n1 是动态的）
+        self.n_vars = n0
+        # self.n_conss = 0 
+        
         if allocate:
-            self.var_attributes = torch.zeros(n_vars, d0, device=self.device)
-            self.cons_attributes = torch.zeros(n_conss, d1, device=self.device)
-            self.local_edge_index = torch.empty((2, 0), dtype=torch.long, device=self.device)
-            self.local_edge_attr = torch.empty((0, 1), dtype=torch.float32, device=self.device)
+            self.var_attributes = torch.zeros(n0, d0, device=self.device)
+            # 增加约束内存分配
+            self.cons_attributes = None # 稍后根据提取到的约束数量动态分配
+            self.cons_block_idxs = []
         else:
             self.var_attributes = None
             self.cons_attributes = None
-            self.local_edge_index = None
-            self.local_edge_attr = None
+            self.cons_block_idxs = None
+            
+        # 预留边存储空间
+        self.local_edge_index = None
+        self.local_edge_attr = None
 
     def copy(self):
-        # 创建新对象，不分配内存
-        new_copy = BipartiteGraphStatic0(self.n_vars, self.n_conss, self.device, self.d0, self.d1, allocate=False)
+        # 创建新对象
+        new_copy = BipartiteGraphStatic0(self.n0, self.device, self.d0, self.d1, allocate=False)
         
-        # 1. 【核心】只深拷贝（clone）变量特征，因为只有变量的 Bound 会随着结点改变！
+        # 1. 复制变量特征
         if self.var_attributes is not None:
             new_copy.var_attributes = self.var_attributes.clone()
         
-        # 2. 【核心】浅拷贝（共享内存）约束特征和边矩阵，节约 99% 的内存！
-        new_copy.cons_attributes = self.cons_attributes
-        new_copy.local_edge_index = self.local_edge_index
-        new_copy.local_edge_attr = self.local_edge_attr
+        # 2. 复制约束特征 (修复你之前的丢失问题)
+        if hasattr(self, 'cons_attributes') and self.cons_attributes is not None:
+            new_copy.cons_attributes = self.cons_attributes.clone()
+            # new_copy.n_conss = self.n_conss
+            
+        # 3. 复制边信息 (K-Hop 模式下至关重要)
+        if hasattr(self, 'local_edge_index') and self.local_edge_index is not None:
+            new_copy.local_edge_index = self.local_edge_index.clone()
+            new_copy.local_edge_attr = self.local_edge_attr.clone()
+            
+        new_copy.cons_block_idxs = self.cons_block_idxs
         
         return new_copy

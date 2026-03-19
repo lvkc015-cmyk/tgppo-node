@@ -143,7 +143,7 @@ class NodeSelector(Nodesel):
 
             
             #  提取图结构
-            self.recorder.record_sub_milp_graph(self.model, curr_node)
+            self.recorder.record_sub_milp_graph(self.model, curr_node, task='node_select',k_hops=2)
             
             graph_data = self.recorder.recorded[curr_node.getNumber()]
             
