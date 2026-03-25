@@ -208,6 +208,19 @@ class NodeSelector(Nodesel):
 
             padding_mask = None
 
+            # 🚨 插入以下调试探针 🚨
+            # print(f"\n[探针] 正在进行第 {self.model.getNNodes()} 个节点的选择...")
+            # print(f"[探针] 当前 SCIP 给出的候选节点池大小: {len(open_nodes)}")
+           
+            
+            # # 提取候选节点的数字 ID 看看
+            # node_numbers = [n.getNumber() for n in open_nodes]
+            # print(f"[探针] 候选节点的数字 ID: {node_numbers}")
+            
+            # # 验证是否有已经被截断 (cutoff) 甚至是 None 的废节点
+            # node_status = [n.getLowerbound() for n in open_nodes]
+            # print(f"[探针] 候选节点的松弛下界 (检查是否有 inf): {node_status}")
+
             # 请求智能体进行决策
             # final_action 会返回在 open_nodes 中的索引
             final_action, value, log_prob, truncated_state, truncated_action = self.agent.choose_action(
@@ -231,6 +244,8 @@ class NodeSelector(Nodesel):
             # 核心改造点 4：返回选择的结点给 SCIP
             # =========================================================================
             selected_node = open_nodes[final_action] 
+            # print(f"[探针] 模型做出的选择 (Action index): {final_action.item()}")
+            # print(f"[探针] 准备向 SCIP 提交选中的节点编号: {selected_node.getNumber()}\n")
 
             # 记录本步状态，供下一次迭代保存
             self.prev_state = {

@@ -23,6 +23,9 @@ class RewardNodeSelection:
         self.scale_range = (1.5, 5.0)  # 简单问题用 1.5，极难问题放大到 5.0
         self.depth_boost = 2.0 # 随搜索深度额外放大的倍数上限
         self.current_scale = scale
+
+        # 引入绝对生存税，只要走一步就必须扣分
+        self.base_step_penalty = -0.05
         
         # --- 核心权重分配 (初始默认值，会在 reset 中被覆盖) ---
         self.w1 = 1.0  # 进步权重 (最重要，一旦突破给予重奖)
@@ -36,8 +39,8 @@ class RewardNodeSelection:
         # --- 新增：停滞监测参数 ---
         self.stagnation_counter = 0  # 连续无进展计数器
         #self.base_time_penalty = -0.01  # 基础每步惩罚（极小，防止抵消正常奖励）
-        self.penalty_step = 0.005  # 停滞累积因子
-        self.penalty_floor = -0.2      # 惩罚下限：无论停滞多久，单步惩罚不低于此值
+        self.penalty_step = 0.02  # 停滞累积因子
+        self.penalty_floor = -0.5      # 惩罚下限：无论停滞多久，单步惩罚不低于此值
 
         self.floor_range = (-0.4, -0.1)  # 简单问题扣分狠，难题扣分轻
         self.step_range = (0.01, 0.002)  # 简单问题惩罚累积快，难题累积慢
@@ -101,14 +104,15 @@ class RewardNodeSelection:
         self.w2 /= s
         self.w3 /= s
 
+
     
     def set_action_feedback(self, norm_lb, norm_est, switch_penalty):
-        # norm_lb 和 norm_est 越小越好 (0 是最好，1 是最差)
-        # 我们把它翻转成奖励：1 是最好，0 是最差
-        #范围在[-0.75, 0.75]
-        self.last_r_promise = (
-                (1.0 - norm_lb) + self.gamma * (1.0 - norm_est)
-            ) - (1.0 + self.gamma) / 2
+        
+        # 最完美的结点给出 0 分，越差的结点扣分越多。绝对不给正分！
+        promise_penalty = (norm_lb + self.gamma * norm_est) / (1.0 + self.gamma) 
+        
+        # 加个负号，让它变成惩罚项
+        self.last_r_promise = -promise_penalty  # 范围在 [-1.0, 0.0]
         self.last_r_switch = switch_penalty
 
 
@@ -174,8 +178,10 @@ class RewardNodeSelection:
         self.prev_db = db
 
         if not done:
+            # 只要没解完，每走一步底薪就是负的！
+            base_step_penalty = -0.05
             # 代入你的宏伟公式
-            reward = (self.w1 * r_progress) + (self.w2 * self.last_r_promise) - (self.w3 * self.last_r_switch)+ \
+            reward = base_step_penalty + (self.w1 * r_progress) + (self.w2 * self.last_r_promise) - (self.w3 * self.last_r_switch)+ \
                         stagnation_penalty
 
             return float(np.clip(reward, -5.0, 5.0))
