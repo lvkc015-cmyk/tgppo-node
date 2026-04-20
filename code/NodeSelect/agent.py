@@ -160,9 +160,10 @@ class Agent:
         next_value = bootstrap_value
         gae = torch.zeros((), device=rewards.device)
         for t in reversed(range(T_)):
+            # Codex note: 这里按标准 GAE 公式只使用 done[t] 屏蔽第 t 条转移；
+            # 不能再额外用 dones[t + 1] 去清零 V(s_{t+1})，否则会污染终止附近的优势估计。
             nonterminal = 1.0 - dones[t]
             nv = next_value if t == T_ - 1 else values[t + 1]
-            nv = nv * (1.0 - dones[t + 1]) if t < T_ - 1 else nv
             delta = rewards[t] + self.gamma * nv * nonterminal - values[t]
             gae = delta + self.gamma * self.gae_lambda * nonterminal * gae
             advantages[t] = gae
@@ -334,14 +335,14 @@ class Agent:
                     # ==========================================
                     # ⬇️ 插入：概率饱和度验证代码 ⬇️
                     # ==========================================
-                    with torch.no_grad():
-                        _max_p = action_probs.max().item()
-                        _min_p = action_probs.min().item()
+                    # with torch.no_grad():
+                    #     _max_p = action_probs.max().item()
+                    #     _min_p = action_probs.min().item()
                         
-                        if iter % 5 == 0:  # 限制打印频率，每 5 个 Batch 看一次
-                            print(f"DEBUG [Probs] Batch {iter} | Max Prob: {_max_p:.6f} | Min Prob: {_min_p:.6f}")
-                            if _max_p > 0.99:
-                                print("🚨 警告：出现极端概率！模型处于极度自信（饱和）状态，必然导致梯度消失！")
+                    #     if iter % 5 == 0:  # 限制打印频率，每 5 个 Batch 看一次
+                    #         print(f"DEBUG [Probs] Batch {iter} | Max Prob: {_max_p:.6f} | Min Prob: {_min_p:.6f}")
+                    #         if _max_p > 0.99:
+                    #             print("🚨 警告：出现极端概率！模型处于极度自信（饱和）状态，必然导致梯度消失！")
                     # ==========================================
                     # ⬆️ 插入结束 ⬆️
                     # ==========================================

@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 import torch
 from project.reward import RewardH1, RewardH2, RewardH3
-from NodeSelect.reward_node import RewardNodeSelection
+from NodeSelect.reward_node import RewardNodeSelection,RewardNodeSelection2,RewardNodeSelection3,RewardNodeSelection4
 
 
 def strip_extension(filename):
@@ -39,6 +39,12 @@ def get_reward(name):
         return RewardH3()
     if name.lower() == "reward_node":
         return RewardNodeSelection()
+    if name.lower() == "reward_node2":
+        return RewardNodeSelection2()
+    if name.lower() == "reward_node3":
+        return RewardNodeSelection3()
+    if name.lower() == "reward_node4":
+        return RewardNodeSelection4()
     else:
         raise ValueError(f"Unsupported reward function '{name}'.")
 
@@ -84,11 +90,7 @@ def save_checkpoint(episode, actor_network, critic_network, actor_optimizer, cri
 
 
 class SCIPStateExtractor:
-    """
-    纯 Python 实现的 SCIP 特征提取器。
-    完美平替原作者通过 Cython 魔改的 getNodeState 和 getMIPState。
-    """
-    
+   
     # 工具函数：相对差距
     @staticmethod
     def relDistance(a, b):
@@ -174,6 +176,8 @@ class SCIPStateExtractor:
             n_open = 0
 
         nnodes = max(model.getNNodes(), 1)
+        max_depth = max(model.getMaxDepth(), 1)
+        plunge_depth = model.getPlungeDepth()
         
         # [0-11] 节点计数与流转统计
         # Python 无法获取 C 底层的内部缓存队列，使用宏观比例代替
@@ -181,7 +185,7 @@ class SCIPStateExtractor:
         state[4] = n_open / nnodes
         state[5] = n_open / nnodes
         state[7] = nnodes / max(nnodes + n_open, 1)
-        state[10] = model.getPlungeDepth() / max(model.getMaxDepth(), 1)
+        state[10] = plunge_depth / max_depth
 
         # [12-15] LP 迭代统计
         nlps = max(model.getNLPs(), 1)
@@ -259,7 +263,7 @@ class SCIPStateExtractor:
             d_q1 = np.quantile(depths, 0.25)
             d_q3 = np.quantile(depths, 0.75)
             
-            state[49] = mean_d / max(model.getMaxDepth(), 1)
+            state[49] = mean_d / max(max_depth, 1)
             state[50] = cls.relDistance(d_q1, d_q3)
             state[51] = std_d / mean_d if mean_d != 0 else 0.0
             state[52] = (d_q3 - d_q1)/(d_q3 + d_q1) if (d_q3 + d_q1) != 0 else 0.0

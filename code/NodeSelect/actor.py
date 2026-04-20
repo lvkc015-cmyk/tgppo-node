@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import inspect
 from torch.distributions import Categorical
 import numpy as np
 from NodeSelect.modules_node import BiMatchingNet, TreeGateBranchingNet
@@ -32,15 +33,18 @@ class Actor(nn.Module):
             nn.GELU()                 # <--- 必须有
         )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,  #随机"丢弃"（暂时移除）网络中的一部分神经元,防止过拟合
-            activation='gelu',
-            batch_first=False,
-            norm_first=True
-        )
+        encoder_kwargs = {
+            "d_model": hidden_dim,
+            "nhead": num_heads,
+            "dim_feedforward": hidden_dim * 4,
+            "dropout": dropout,  #随机"丢弃"（暂时移除）网络中的一部分神经元,防止过拟合
+            "activation": "gelu",
+            "batch_first": False,
+        }
+        if "norm_first" in inspect.signature(nn.TransformerEncoderLayer.__init__).parameters:
+            encoder_kwargs["norm_first"] = True
+
+        encoder_layer = nn.TransformerEncoderLayer(**encoder_kwargs)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
         self.tree_refinement = BiMatchingNet(hidden_dim)
@@ -59,6 +63,7 @@ class Actor(nn.Module):
 
     def forward(self, cands_state_mat, node_state, mip_state, norm_cons, norm_edge_idx, norm_edge_attr, norm_var, norm_bounds,  padding_mask=None, mb_cons_batch=None, mb_var_batch=None):
 
+       
         # 1. 图特征提取
         graph_embedding = self.gnn_policy.forward_graph(
                 norm_cons, norm_edge_idx, norm_edge_attr, norm_var, norm_bounds, constraint_batch=mb_cons_batch, 
@@ -106,7 +111,7 @@ class Actor(nn.Module):
         # ⬇️ 瘦身版 X光诊断探针代码 ⬇️
         # ==========================================
         # import random
-        # if random.random() < 0.1:  # 抽样打印，避免刷屏
+        # if random.random() < 0.05:  # 抽样打印，避免刷屏
         #     with torch.no_grad():
         #         print("\n" + "="*50)
         #         print("🚨 X-RAY DIAGNOSTICS: FEATURE SHIFT 🚨")
@@ -140,8 +145,49 @@ class Actor(nn.Module):
             # -1e8 在经过 softmax 后已经是 0 了，但对计算梯度的稳定性要好一万倍
             action_logits = action_logits.masked_fill(padding_mask, -1e8)
 
+        # ==========================================
+        # 🕵️ 抓鬼探针：只看有效的 Logits (排除掉 -1e8 的 padding)
+        # ==========================================
+        # if padding_mask is not None:
+        #     valid_logits = action_logits[~padding_mask]
+        # else:
+        #     valid_logits = action_logits
+
+        # print(f"[{'Iter 0 初相见' if not hasattr(self, '_printed_iter0') else '后续 Iter'}] "
+        #       f"Logits Max: {valid_logits.max().item():.4f} | "
+        #       f"Logits Min: {valid_logits.min().item():.4f} | "
+        #       f"Logits Mean: {valid_logits.mean().item():.4f} | "
+        #       f"Logits Std: {valid_logits.std().item():.4f}")
+        # self._printed_iter0 = True
+        # ==========================================
+
+        # with torch.no_grad():
+        #     # 计算有效节点的 logit 差值
+        #     # 这里的 action_logits 已经经过了 -1e8 的 mask 填充
+        #     v_mask = ~padding_mask if padding_mask is not None else torch.ones_like(action_logits, dtype=torch.bool)
+            
+        #     # 统计每个 Batch 内部的情况
+        #     for b in range(action_logits.size(0)):
+        #         b_logits = action_logits[b][v_mask[b]]
+        #         if b_logits.numel() > 0:
+        #             b_max = b_logits.max().item()
+        #             b_min = b_logits.min().item()
+        #             b_delta = b_max - b_min
+        #             num_valid = b_logits.numel()
+                    
+        #             # 关键逻辑：如果 Delta > 15，Softmax 结果在 float32 精度下必然出现 1.0
+        #             if b_delta > 15 or num_valid == 1:
+        #                 print(f"🚨 [饱和预警] Batch {b}: 有效节点={num_valid} | Logits差值={b_delta:.4f}")
+        #                 if num_valid > 1:
+        #                     # 打印出最高分和次高分，看是不是悬殊太大
+        #                     top_values, _ = torch.topk(b_logits, min(2, num_valid))
+        #                     print(f"   - Top1 Logit: {top_values[0]:.4f}, Top2 Logit: {top_values[1] if num_valid>1 else 'N/A'}")
+        #                 else:
+        #                     print(f"   - 孤岛节点：该样本只有一个可选动作，属于‘被迫自信’")
         # 最终输出概率分布给 Agent 进行 Categorical 采样
         action_probs = F.softmax(action_logits, dim=-1)
+        # if (action_probs > 0.999).any():
+        #      print(f"DEBUG [Probs] Max Prob: {action_probs.max().item():.6f} | Min Prob: {action_probs.min().item():.6f}")
         return action_probs
 
 

@@ -1,4 +1,18 @@
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _TENSORBOARD_AVAILABLE = True
+except ModuleNotFoundError:
+    _TENSORBOARD_AVAILABLE = False
+
+    class SummaryWriter:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            self.log_dir = kwargs.get("log_dir")
+
+        def add_scalar(self, *args, **kwargs):
+            return None
+
+        def close(self):
+            return None
 import sys
 import os
 from datetime import datetime
@@ -115,6 +129,8 @@ class MetricsTrialLogger:
 
         self.logger = logging.getLogger(f"MetricsTrialLogger_trial_{trial_id}")
         self.logger.info(f"MetricsTrialLogger initialized with CSV path {self.csv_path} and TensorBoard path {self.tb_path}")
+        if not _TENSORBOARD_AVAILABLE:
+            self.logger.warning("tensorboard is not installed; TensorBoard logging is disabled.")
 
     def log_episode(self, episode_metrics, metrics_type='train'):
         """
@@ -168,5 +184,4 @@ class MetricsTrialLogger:
             self.logger.info("Closed MetricsTrialLogger and TensorBoard writer")
         except Exception as e:
             self.logger.error(f"Error closing MetricsTrialLogger: {e}")
-
 

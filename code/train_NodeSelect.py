@@ -72,6 +72,42 @@ def save_metrics_to_csv(metrics: dict, filepath: str):
         df.to_csv(filepath, index=False)
 
 
+def apply_transition_cap(traj_dict: Dict[str, Any], transition_cap: int) -> Tuple[Dict[str, Any], int]:
+    """Keep a contiguous prefix so truncated trajectories still support bootstrap GAE."""
+    if transition_cap <= 0:
+        return traj_dict, 0
+
+    n = int(traj_dict.get("num_transitions", 0))
+    if n <= transition_cap:
+        return traj_dict, 0
+
+    capped = dict(traj_dict)
+    capped["num_transitions"] = transition_cap
+
+    transition_keys = (
+        "cands_states",
+        "mip_states",
+        "node_states",
+        "norm_conss",
+        "norm_vars",
+        "norm_edge_idxs",
+        "norm_edge_attrs",
+        "norm_boundss",
+        "actions",
+        "rewards",
+        "dones",
+        "log_probs",
+        "values",
+        "advantages",
+        "returns",
+    )
+    for key in transition_keys:
+        if key in traj_dict:
+            capped[key] = traj_dict[key][:transition_cap]
+
+    return capped, n - transition_cap
+
+
 def _fix_torch_threads():
     try:
         torch.set_num_threads(1)
@@ -86,6 +122,8 @@ class TrainArgs:
     temp_traj_dir: str
     scip_setting: str
     time_limit: float
+    depth_threshold: int
+    transition_cap: int
     seeds: List[int]
     per_job_timeout: int
     max_workers: int
@@ -187,6 +225,64 @@ def build_agent_env_with_models(actor: Actor, critic: Critic, cfg: TrainArgs, se
         scip_seed=seed,
         reward_func=reward_func,
         logger=logger,
+    )
+    return agent, env
+
+
+def apply_optimizer_hparams(optimizer: torch.optim.Optimizer, lr: float) -> None:
+    # Codex note: when resuming from a checkpoint with optimizer state, explicitly re-apply the
+    # configured learning rate so changes in best_params.json actually take effect after reload.
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = lr
+
+
+def build_eval_env_with_models(actor: Actor, critic: Critic, cfg: TrainArgs, seed: int,
+                               logger: logging.Logger) -> Tuple[Agent, Environment]:
+    # Codex note: 按用户当前要求，validation 走“无 gating + 确定性推理”路径，
+    # 用来单独观察纯策略本身的质量；因此这里保持 deterministic=True，但显式关闭 gating。
+    device = get_device(device="cpu")
+
+    actor.to(device)
+    critic.to(device)
+
+    actor_opt = torch.optim.AdamW(actor.parameters(), lr=1e-4)
+    critic_opt = torch.optim.AdamW(critic.parameters(), lr=1e-4)
+
+    reward_func = get_reward(cfg.reward_function)
+
+    agent = Agent(
+        actor_network=actor,
+        actor_optimizer=actor_opt,
+        critic_network=critic,
+        critic_optimizer=critic_opt,
+        policy_clip=cfg.policy_clip,
+        entropy_weight=cfg.entropy_weight,
+        gamma=cfg.gamma,
+        gae_lambda=cfg.gae_lambda,
+        batch_size=cfg.batch_size,
+        n_epochs=1,
+        device=device,
+        state_dims=state_dims,
+        logger=logger,
+    )
+
+    scip_params = settings.get(cfg.scip_setting, {}).copy()
+    limits = scip_limits.copy()
+    limits["time_limit"] = float(cfg.time_limit)
+    limits["node_limit"] = -1
+
+    env = Environment(
+        device=device,
+        agent=agent,
+        state_dims=state_dims,
+        scip_limits=limits,
+        scip_params=scip_params,
+        scip_seed=seed,
+        reward_func=reward_func,
+        logger=logger,
+        depth_threshold=cfg.depth_threshold,
+        use_gating=False,
+        deterministic=True,
     )
     return agent, env
 
@@ -413,7 +509,8 @@ def validation_job(job: Tuple[str, int, bytes, TrainArgs, Dict[str, Any]]) -> Ep
     actor, critic = build_models(cfg)
     load_weights_bytes(actor, critic, weights_bytes)
     actor.eval(); critic.eval()
-    agent, env = build_agent_env_with_models(actor, critic, cfg, seed, logger)
+    # Codex note: validation 需要模拟最终测试链路，不能复用训练 rollout 的 Environment 配置。
+    agent, env = build_eval_env_with_models(actor, critic, cfg, seed, logger)
 
     name = strip_extension(os.path.basename(instance_path)).split(".")[0]
     meta = info_dict.get(name, {})
@@ -425,7 +522,7 @@ def validation_job(job: Tuple[str, int, bytes, TrainArgs, Dict[str, Any]]) -> Ep
 
     try:
         env.reset(instance_path, cutoff, baseline_nodes, baseline_gap, baseline_integral, baseline_status)
-        done, info, ep_reward = env.run_episode(learn=False)
+        done, info, ep_reward = env.run_episode()
         status = str(info.get("status"))
         nnodes = int(info.get("nnodes", 0))
         solve_time = float(info.get("scip_solve_time", 0.0))
@@ -496,6 +593,10 @@ def main():
     parser.add_argument('--checkpoint_dir', type=str, default='bi_output/checkpoints')
 
     parser.add_argument('--time_limit', type=float, default=3600.0)
+    parser.add_argument('--depth_threshold', type=int, default=-1,
+                        help='验证/测试链路里 GNN 工作的最大深度截断值')
+    parser.add_argument('--transition_cap', type=int, default=-1,
+                        help='每个实例最多导入多少条连续 transition<=0 表示关闭')
     parser.add_argument('--per_job_timeout', type=int, default=3700) #每个并行工作任务的最大允许执行时间
     parser.add_argument('--scip_setting', type=str, default='sandbox')
     parser.add_argument('--seeds', type=int, nargs='+', default=[0,1,2])
@@ -505,6 +606,12 @@ def main():
 
     parser.add_argument('--val_instances_dir', type=str, default=None)
     parser.add_argument('--val_seeds', type=int, nargs='+', default=[0])
+    parser.add_argument('--validate_every', type=int, default=10,
+                        help='Codex note: 每隔多少轮训练执行一次 validation；<=0 表示关闭周期验证')
+    parser.add_argument('--resume_from_iter', type=int, default=None,
+                        help='Codex note: 指定从哪个 iteration 的 checkpoint 续训；默认自动选择最新 checkpoint')
+    parser.add_argument('--reset_optimizer_on_resume', action='store_true',
+                        help='Codex note: 续训时只加载模型权重，不继承 AdamW 动量状态')
     
     # [新增] 提取硬编码的文件名和路径作为参数
     # ---------------------------------------------------------
@@ -543,6 +650,8 @@ def main():
         temp_traj_dir=args.temp_traj_dir,
         scip_setting=args.scip_setting,
         time_limit=args.time_limit,
+        depth_threshold=args.depth_threshold,
+        transition_cap=args.transition_cap,
         seeds=args.seeds,
         per_job_timeout=args.per_job_timeout,
         max_workers=args.max_workers,
@@ -594,9 +703,15 @@ def main():
 
     start_iteration = 1
     if checkpoints:
-        # 提取数字并找到最大的
-        iters = [int(re.findall(r'\d+', f)[0]) for f in checkpoints]
-        latest_it = max(iters)
+        # Codex note: allow resuming from a stable earlier checkpoint instead of always taking the latest one.
+        iters = sorted(int(re.findall(r'\d+', f)[0]) for f in checkpoints)
+        if args.resume_from_iter is not None:
+            if args.resume_from_iter not in iters:
+                logger.error(f"Requested --resume_from_iter={args.resume_from_iter}, but available checkpoints are: {iters}")
+                sys.exit(1)
+            latest_it = args.resume_from_iter
+        else:
+            latest_it = max(iters)
         ckpt_path = os.path.join(ckpt_dir, f"ckpt_iter_{latest_it}.pt")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -605,16 +720,20 @@ def main():
         checkpoint = torch.load(ckpt_path, map_location=device)
         actor.load_state_dict(checkpoint['actor'])
         critic.load_state_dict(checkpoint['critic'])
-        # 如果 agent 也存了优化器状态，也可以加载
-        # agent.actor_optimizer.load_state_dict(checkpoint['actor_optimizer'])
-        # 【修复2】严格加载优化器状态，保住 AdamW 的动量！
-        if 'actor_opt' in checkpoint and checkpoint['actor_opt'] is not None:
-            agent.actor_optimizer.load_state_dict(checkpoint['actor_opt'])
-        if 'critic_opt' in checkpoint and checkpoint['critic_opt'] is not None:
-            agent.critic_optimizer.load_state_dict(checkpoint['critic_opt'])
+        # Codex note: optionally drop old optimizer moments when resuming from an unstable training phase.
+        if not args.reset_optimizer_on_resume:
+            if 'actor_opt' in checkpoint and checkpoint['actor_opt'] is not None:
+                agent.actor_optimizer.load_state_dict(checkpoint['actor_opt'])
+            if 'critic_opt' in checkpoint and checkpoint['critic_opt'] is not None:
+                agent.critic_optimizer.load_state_dict(checkpoint['critic_opt'])
+        apply_optimizer_hparams(agent.actor_optimizer, targs.actor_lr)
+        apply_optimizer_hparams(agent.critic_optimizer, targs.critic_lr)
         
         start_iteration = latest_it + 1
-        logger.info(f">>> Found checkpoint. Resuming from Iteration {latest_it}, next is {start_iteration}")
+        logger.info(
+            f">>> Found checkpoint. Resuming from Iteration {latest_it}, next is {start_iteration}; "
+            f"reset_optimizer_on_resume={args.reset_optimizer_on_resume}"
+        )
 
         # 【修复3】继承之前的 JSON 日志，防止历史数据被覆盖清空
         progress_json_path = os.path.join(args.logs_dir, args.progress_json_name)
@@ -665,10 +784,12 @@ def main():
                 traj_files = [f for f in os.listdir(traj_dir) if f.endswith('.pkl')]
             try:
                 if  traj_files:
-                    sample_size = 100
+                    sample_size = 64
                     sampled_files = random.sample(traj_files, min(sample_size, len(traj_files)))
+                    capped_traj_count = 0
+                    capped_transition_count = 0
                     
-                    for filename in sampled_files[:100]:
+                    for filename in sampled_files[:64]:
                         file_path = os.path.join(traj_dir, filename)
                         
                         if not os.path.exists(file_path):
@@ -681,6 +802,10 @@ def main():
                             
                             # 2. 导入 Memory 并删除文件（必须删掉，否则会重复读取）
                             if traj_dict:
+                                traj_dict, dropped_steps = apply_transition_cap(traj_dict, targs.transition_cap)
+                                if dropped_steps > 0:
+                                    capped_traj_count += 1
+                                    capped_transition_count += dropped_steps
                                 agent.memory.import_dict(traj_dict)
                                 num_traj_collected += 1
                             # 必须显式删除并清理
@@ -695,8 +820,14 @@ def main():
                             # 如果文件正在写（虽然 rename 已经规避了大部分情况）或损坏，跳过
                             continue
 
+                    if capped_traj_count > 0:
+                        logger.info(
+                            f">>> [LEARNER] transition_cap={targs.transition_cap} "
+                            f"truncated {capped_traj_count} trajs, dropped {capped_transition_count} transitions."
+                        )
+
                 should_learn = False
-                if num_traj_collected >= last_learn_traj_count + 100 and len(agent.memory) >= targs.batch_size:
+                if num_traj_collected >= last_learn_traj_count + 64 and len(agent.memory) >= targs.batch_size:
                     should_learn = True
                 
                 # 条件 B: Worker 全部结束，把最后不足 15 个的数据也练了
@@ -751,7 +882,8 @@ def main():
 
         # Optional interim validation  可选验证（不参与训练）
         val_score = None
-        if val_instances:
+        # Codex note: validation 改为周期执行，避免每轮都跑 35 个验证实例导致训练节奏过慢。
+        if val_instances and args.validate_every > 0 and (it % args.validate_every == 0):
             final_w = serialize_weights(actor, critic)
             vjobs = [(inst, s, final_w, targs, info_dict) for inst in val_instances for s in (args.val_seeds or [0])]
             vmetrics = run_parallel_in_batches(

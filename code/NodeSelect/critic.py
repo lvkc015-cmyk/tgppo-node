@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import inspect
 from torch.distributions import Categorical
 import numpy as np
 from NodeSelect.modules_node import BiMatchingNet, TreeGateBranchingNet
@@ -32,15 +33,18 @@ class Critic(nn.Module):
             nn.GELU()
         )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=False,
-            norm_first=True # 推荐开启，对训练稳定性更好
-        )
+        encoder_kwargs = {
+            "d_model": hidden_dim,
+            "nhead": num_heads,
+            "dim_feedforward": hidden_dim * 4,
+            "dropout": dropout,
+            "activation": "gelu",
+            "batch_first": False,
+        }
+        if "norm_first" in inspect.signature(nn.TransformerEncoderLayer.__init__).parameters:
+            encoder_kwargs["norm_first"] = True  # 推荐开启，对训练稳定性更好
+
+        encoder_layer = nn.TransformerEncoderLayer(**encoder_kwargs)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
         # self.tree_refinement = BiMatchingNet(hidden_dim)

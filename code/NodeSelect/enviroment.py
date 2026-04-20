@@ -1,5 +1,6 @@
 import pyscipopt as scip
 import gc
+import math
 import traceback
 from project.utils import init_params
 from project.utils.functions import SCIPStateExtractor
@@ -9,7 +10,7 @@ from NodeSelect.nodeselector import NodeSelector
 from NodeSelect.bi_graph import LPFeatureRecorder
 
 class Environment:
-    def __init__(self, device, agent, state_dims, scip_limits, scip_params, scip_seed, reward_func, logger):
+    def __init__(self, device, agent, state_dims, scip_limits, scip_params, scip_seed, reward_func, logger,depth_threshold=-1,use_gating=False, deterministic=False):
         self.device = device
         self.agent = agent
         self.var_dim = state_dims["var_dim"]
@@ -22,6 +23,9 @@ class Environment:
         self.scip_seed = scip_seed
         self.reward_func = reward_func
         self.logger = logger
+        self.depth_threshold = depth_threshold
+        self.use_gating=use_gating
+        self.deterministic = deterministic
 
         self.model = None
         self.node_selector = None  # 原本是 self.brancher
@@ -73,7 +77,7 @@ class Environment:
             bs = baseline_status if baseline_status is not None else 'timelimit'
 
             self.reward_func.reset(baseline_nodes=bn, baseline_gap=bg, baseline_pdi=bp,
-                                   solver_status=bs, time_limit=900, logger=self.logger)
+                                   solver_status=bs, time_limit=400, logger=self.logger)
 
             if self.scip_params.get('cutoff', False) and self.cutoff is not None:
                 self.model.setObjlimit(float(self.cutoff))
@@ -100,6 +104,9 @@ class Environment:
                 cutoff=self.cutoff,
                 logger=self.logger,
                 recorder=self.recorder,
+                depth_threshold=self.depth_threshold,
+                use_gating=self.use_gating,
+                deterministic=self.deterministic,
             )
 
             # 2. 挂载到 SCIP，注意使用 includeNodesel
@@ -125,7 +132,15 @@ class Environment:
 
             episode_stats = self.node_selector.get_episode_stats()
             episode_reward = episode_stats['total_reward']
-            gap_val = 0.0 if done else self.model.getGap()
+            raw_gap = float(self.model.getGap())
+            # Codex note: episode 的 terminal 状态不等于“最优性 gap 为 0”。
+            # 只有精确证明结束的状态才强制记为 0；timelimit / nodelimit 等必须保留真实 gap。
+            if status in ("optimal", "infeasible", "unbounded"):
+                gap_val = 0.0
+            elif math.isnan(raw_gap):
+                gap_val = float("inf")
+            else:
+                gap_val = raw_gap
 
             info = {
                 "status": status,

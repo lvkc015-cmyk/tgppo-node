@@ -4,6 +4,7 @@ import numpy as np
 import time
 import gc
 from collections import OrderedDict
+import math
 
 class LPFeatureRecorder():
     #model：SCIP 模型;  device：GNN 使用的设备（CPU / GPU）
@@ -135,7 +136,7 @@ class LPFeatureRecorder():
         else:
             # 如果极端情况下 cands 为 None (例如 SCIP 初始状态)，我们主动获取一次种子
             if cands is None:
-                print("候选变量为空")
+                print("候选变量为空")  
                 cands, _, _ = model.getCandsState(self.var_dim, self.branch_count)
                 # 如果依然拿不到，截取前 100 个变量作为兜底种子（防止程序崩溃）
                 if not cands:
@@ -260,7 +261,7 @@ class LPFeatureRecorder():
                         selected_conss_dict[cons.name] = cons
                         total_edges += nz
                 else:
-                    print(f"Warning: Hard truncation by Activity Score at step {i}. Edges: {total_edges}")
+                    # print(f"Warning: Hard truncation by Activity Score at step {i}. Edges: {total_edges}")
                     limit_reached = True
                     break
 
@@ -500,27 +501,36 @@ class LPFeatureRecorder():
                 local_idx = var_map.get(global_idx)
                 if local_idx is not None:
                     val = bbound
-                    is_inf = 0
-                    if btype == 0: # SCIP_BOUNDTYPE_LOWER
-                        is_inf = 1 if val <= -SCIP_INF else 0
-                    else:          # SCIP_BOUNDTYPE_UPPER
-                        is_inf = 1 if val >= SCIP_INF else 0
 
-                    # 规则：如果是无穷大，数值位归 0
+                    is_inf = 1 if abs(val) >= SCIP_INF else 0
                     clean_val = val if not is_inf else 0.0
+
+                    # is_inf = 0
+                    # if btype == 0: # SCIP_BOUNDTYPE_LOWER
+                    #     is_inf = 1 if val <= -SCIP_INF else 0
+                    # else:          # SCIP_BOUNDTYPE_UPPER
+                    #     is_inf = 1 if val >= SCIP_INF else 0
+
+                    # # 规则：如果是无穷大，数值位归 0
+                    # clean_val = val if not is_inf else 0.0
 
                     # 3. 写入特征矩阵 (严格对应 10 维索引)
                     # res[0]:sol, [1]:lb, [2]:ub, [3]:is_lb_inf, [4]:is_ub_inf ...
                     target_val_col = int(btype) + 1  # btype 0->col 1 (lb), 1->col 2 (ub)
                     target_flag_col = int(btype) + 3 # btype 0->col 3 (is_lb), 1->col 4 (is_ub)
+
+                    compressed_val = math.copysign(1.0, clean_val) * math.log1p(abs(clean_val))
                     # 写入数值
-                    graph.var_attributes[local_idx, target_val_col] = clean_val
+                    graph.var_attributes[local_idx, target_val_col] = compressed_val
                     # 写入标志位
                     graph.var_attributes[local_idx, target_flag_col] = float(is_inf)
 
+
                     current_s = bvar.getLPSol()
                     is_s_inf = 1 if abs(current_s) >= SCIP_INF else 0
-                    graph.var_attributes[local_idx, 0] = current_s if not is_s_inf else 0.0
+                    clean_s = current_s if not is_s_inf else 0.0
+                    compressed_s = math.copysign(1.0, clean_s) * math.log1p(abs(clean_s))
+                    graph.var_attributes[local_idx, 0] = compressed_s if not is_s_inf else 0.0
                     graph.var_attributes[local_idx, 9] = float(is_s_inf)
 
 

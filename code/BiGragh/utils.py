@@ -73,10 +73,24 @@ def normalize_graph(constraint_features, edge_index, edge_attr, variable_feature
     
     # 2. 变量 Bound 归一化 (对应第1, 2列: lb, ub)
     # 我们顺便把第0列的 sol 也带上，因为解的大小随 Bound 缩放
-    var_max_bounds = torch.max(torch.abs(variable_features[:, 1:3]), axis=1, keepdim=True)[0]
-    var_max_bounds = torch.clamp(var_max_bounds, min=1e-9) # 优雅替代 .add_(==0)
+    # var_max_bounds = torch.max(torch.abs(variable_features[:, 1:3]), axis=1, keepdim=True)[0]
+    # var_max_bounds = torch.clamp(var_max_bounds, min=1e-9) # 优雅替代 .add_(==0)
     
-    variable_features[:, 0:3].div_(var_max_bounds) # 同时缩放 sol, lb, ub
+    # variable_features[:, 0:3].div_(var_max_bounds) # 同时缩放 sol, lb, ub
+
+    variable_features[:, 0:3] = torch.clamp(variable_features[:, 0:3], min=-1e6, max=1e6)
+    
+    # 提取每一行的局部最大边界绝对值作为分母
+    var_max_bounds = torch.max(torch.abs(variable_features[:, 1:3]), dim=1, keepdim=True)[0]
+    
+    # 第二层护甲：【防特征爆炸】拦截固定变量的极小极差
+    # 如果该变量 lb 和 ub 都是 0，var_max_bounds 就是 0。
+    # 此时绝对不能用 1e-9 做分母！直接把分母强行设为 1.0！
+    # 这样，就算 sol 有 0.12 的浮点误差，0.12 / 1.0 = 0.12，绝不会爆炸成 1.2亿。
+    var_max_bounds[var_max_bounds < 1e-3] = 1.0 
+    
+    # 安全执行除法
+    variable_features[:, 0:3].div_(var_max_bounds)
     
     # 3. 边属性缩放 (edge_attr)
     # var_normalizor = var_max_bounds[edge_index[0]]
@@ -94,13 +108,18 @@ def normalize_graph(constraint_features, edge_index, edge_attr, variable_feature
     
     # 4. 约束归一化
     # constraint_features[:, 0].div_(torch.abs(constraint_features[:, 0]) + (constraint_features[:, 0] == 0))
-    cons_max_vals = torch.max(torch.abs(constraint_features[:, 0:2]), dim=1, keepdim=True)[0]
-    cons_max_vals = torch.clamp(cons_max_vals, min=1e-9)
-    # 重点：同时缩放第 0 列和第 1 列
-    constraint_features[:, 0:2].div_(cons_max_vals)
-    
-    # 5. 步数归一化
-    bounds.div_(bound_normalizor)
+    # cons_max_vals = torch.max(torch.abs(constraint_features[:, 0:2]), dim=1, keepdim=True)[0]
+    # cons_max_vals = torch.clamp(cons_max_vals, min=1e-9)
+    # # 重点：同时缩放第 0 列和第 1 列
+    # constraint_features[:, 0:2].div_(cons_max_vals)
+
+    if constraint_features.numel() > 0:
+        constraint_features[:, 0:2] = torch.clamp(constraint_features[:, 0:2], min=-1e6, max=1e6)
+        
+        cons_max_vals = torch.max(torch.abs(constraint_features[:, 0:2]), dim=1, keepdim=True)[0]
+        cons_max_vals[cons_max_vals < 1e-3] = 1.0 
+        
+        constraint_features[:, 0:2].div_(cons_max_vals)
 
     # 打印每一列的极大值，看看归一化到底有没有把该压的压下来
     # for i in range(variable_features.shape[1]):

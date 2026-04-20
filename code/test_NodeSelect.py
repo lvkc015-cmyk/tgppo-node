@@ -35,6 +35,7 @@ class TestArgs:
     seeds: List[int]
     shift: float
     hparams: Dict[str, Any] # 新增：网络超参数
+    depth_threshold: int
 
 class EpisodeMetrics(NamedTuple):
     instance: str; seed: int; status: str
@@ -101,11 +102,15 @@ def build_eval_env(actor: Actor, critic: Critic, cfg: TestArgs, seed: int,
     scip_params = settings.get(cfg.scip_setting, {}).copy()
     limits      = scip_limits.copy(); limits["time_limit"] = cfg.time_limit
     limits["node_limit"] = -1
+    reward_name = str(cfg.hparams.get("reward_function", "reward_node"))
 
     env = Environment(
         device=device, agent=agent, state_dims=state_dims,
         scip_limits=limits, scip_params=scip_params,
-        scip_seed=seed, reward_func=get_reward("reward_node"), logger=logger,
+        scip_seed=seed, reward_func=get_reward(reward_name), logger=logger,
+        depth_threshold=cfg.depth_threshold,
+        use_gating=True,
+        deterministic=True,
     )
     return agent, env
 # ---------------------------------------------------------------------------
@@ -286,8 +291,9 @@ def main():
     ap.add_argument("--per_job_timeout",type=int,default=3900)
     ap.add_argument("--scip_setting",default="sandbox")
     ap.add_argument("--seeds",type=int,nargs="+",default=[0])
-    ap.add_argument("--max_workers",type=int,default=40)
+    ap.add_argument("--max_workers",type=int,default=10)
     ap.add_argument("--shift",type=float,default=100.0)
+    ap.add_argument("--depth_threshold", type=int, default=15, help="GNN 工作的最大深度截断值") # 👈 【修改点 3】：新增命令行参数
     args=ap.parse_args()
 
     os.makedirs(args.logs_dir, exist_ok=True)
@@ -302,7 +308,7 @@ def main():
     logger.info(f"Testing on {len(insts)} instances, seeds={args.seeds}")
 
     cfg=TestArgs(args.logs_dir,args.scip_setting,args.time_limit,
-                 args.per_job_timeout,args.max_workers,args.seeds,args.shift,hparams)
+                 args.per_job_timeout,args.max_workers,args.seeds,args.shift,hparams,depth_threshold=args.depth_threshold)
 
     jobs=[(p,s,cfg,info,args.model_path) for p in insts for s in args.seeds]
     res=run_parallel_in_batches(jobs,eval_job,args.max_workers,args.per_job_timeout)
@@ -318,12 +324,12 @@ def main():
         "pdi": "PDI", 
         "gap": "Gap"
     })
-    raw.to_csv(os.path.join(args.logs_dir,"test_runs_raw.csv"),index=False)
+    raw.to_csv(os.path.join(args.logs_dir,"test_ours_200_1000.csv"),index=False)
 
     overall=aggregate_overall(res,args.time_limit,args.shift)
     with open(os.path.join(args.logs_dir,"overall_summary.json"),"w") as f: json.dump(overall,f,indent=2)
     perinst=aggregate_per_instance(res,args.time_limit,args.shift)
-    perinst.to_csv(os.path.join(args.logs_dir,"per_instance_summary.csv"),index=False)
+    # perinst.to_csv(os.path.join(args.logs_dir,"per_instance_summary.csv"),index=False)
 
     logger.info("=== Overall summary ===\n"+json.dumps(overall,indent=2))
 

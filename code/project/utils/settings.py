@@ -6,6 +6,8 @@ def init_params(model, scip_limits, scip_params):
     :return: -
         Initialize SCIP parameters for the model.
     """
+    # 👇 新增这一行：确保 SCIP 原生的 estimate 处于激活状态，且优先级为 200000
+    # model.setIntParam('nodeselection/estimate/stdpriority', 200000)
 
     model.setIntParam('display/verblevel', 0)
 
@@ -113,13 +115,13 @@ settings = {
 
 # limits in solvers
 scip_limits = {
-    'node_limit': 500,
-    'time_limit': 900.,
+    'node_limit': 2500,
+    'time_limit': 300.,
 }
 
 state_dims = {
     'var_dim': 25,
     'node_dim': 8,
     'mip_dim': 53,
-    "node_cand_dim": 6 # 新增：代表你为 Open Nodes 提取的特征 (LB, Est, Depth)
+    "node_cand_dim": 12 # Codex note: 12 维候选池相对特征，保持输入尺寸不变以兼容现有网络结构
 }
